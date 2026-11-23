@@ -95,6 +95,40 @@ operate on double-precision floats (``f8``)::
    1.9993959999999997
 
 
+Parallel compilation with oneTBB
+--------------------------------
+
+Set ``cc.parallel = True`` before building to enable the parallel compiler
+passes for the module's exports. For example::
+
+   from numba import prange
+   from numba.pycc import CC
+
+   cc = CC('parallel_example')
+   cc.parallel = True
+
+   @cc.export('sum_array', 'f8(f8[::1])')
+   def sum_array(a):
+       total = 0.0
+       for i in prange(a.size):
+           total += a[i]
+       return total
+
+   if __name__ == '__main__':
+       cc.compile()
+
+Building requires the oneTBB headers and link library from oneTBB 2021.6 or
+later. Set ``TBBROOT`` to the installation prefix if the compiler cannot find
+them. The generated extension also needs the oneTBB shared library on the
+runtime loader's search path. These requirements apply to both
+``cc.compile()`` and ``cc.distutils_extension()``.
+
+Set ``NUMBA_NUM_THREADS`` before importing the compiled extension to limit the
+size of its oneTBB task arena. The default comes from oneTBB. Numba's JIT
+threading-layer selection and thread and chunk-size setters apply to JIT
+functions. Use the multiprocessing ``spawn`` start method with these extensions.
+
+
 Distutils integration
 ---------------------
 

@@ -449,3 +449,29 @@ extern "C" void do_scheduling_unsigned(uintp num_dim, intp *starts, intp *ends, 
     }
     flatten_schedule(ret, sched);
 }
+
+#ifdef PYCC_TBB
+extern "C" intp *pycc_tbb_schedule(uintp num_dim, intp *starts, intp *ends,
+                                  uintp num_threads, int is_signed, intp debug)
+{
+    if (num_threads > SIZE_MAX / sizeof(intp) / 2 / num_dim) {
+        return nullptr;
+    }
+    intp *sched = allocate_sched(num_threads * num_dim * 2);
+    if (sched == nullptr) {
+        return nullptr;
+    }
+    try {
+        if (is_signed) {
+            do_scheduling_signed(num_dim, starts, ends, num_threads, sched, debug);
+        } else {
+            do_scheduling_unsigned(num_dim, starts, ends, num_threads,
+                                   reinterpret_cast<uintp *>(sched), debug);
+        }
+    } catch (...) {
+        deallocate_sched(sched);
+        return nullptr;
+    }
+    return sched;
+}
+#endif

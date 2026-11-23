@@ -103,13 +103,15 @@ def build_gufunc_kernel(library, ctx, info, sig, inner_ndim):
     intp_t = ctx.get_value_type(types.intp)
     intp_ptr_t = ir.PointerType(intp_t)
 
-    fnty = ir.FunctionType(ir.VoidType(), [ir.PointerType(byte_ptr_t),
-                                           ir.PointerType(intp_t),
-                                           ir.PointerType(intp_t),
-                                           byte_ptr_t])
+    return_ty = ir.IntType(32) if ctx.aot_mode else ir.VoidType()
+    fnty = ir.FunctionType(return_ty, [byte_ptr_ptr_t, intp_ptr_t,
+                                       intp_ptr_t, byte_ptr_t])
     wrapperlib = ctx.codegen().create_library('parallelgufuncwrapper')
     mod = wrapperlib.create_ir_module('parallel.gufunc.wrapper')
-    kernel_name = ".kernel.{}_{}".format(id(info.env), info.name)
+    if ctx.aot_mode:
+        kernel_name = ".kernel." + info.name
+    else:
+        kernel_name = ".kernel.{}_{}".format(id(info.env), info.name)
     lfunc = ir.Function(mod, fnty, name=kernel_name)
 
     bb_entry = lfunc.append_basic_block('')
@@ -122,9 +124,10 @@ def build_gufunc_kernel(library, ctx, info, sig, inner_ndim):
     # Release the GIL (and ensure we have the GIL)
     # Note: numpy ufunc may not always release the GIL; thus,
     #       we need to ensure we have the GIL.
-    pyapi = ctx.get_python_api(builder)
-    gil_state = pyapi.gil_ensure()
-    thread_state = pyapi.save_thread()
+    if not ctx.aot_mode:
+        pyapi = ctx.get_python_api(builder)
+        gil_state = pyapi.gil_ensure()
+        thread_state = pyapi.save_thread()
 
     def as_void_ptr(arg):
         return builder.bitcast(arg, byte_ptr_t)
@@ -137,10 +140,12 @@ def build_gufunc_kernel(library, ctx, info, sig, inner_ndim):
     if not isinstance(sig.return_type, types.NoneType):
         array_count += 1
 
-    parallel_for_ty = ir.FunctionType(ir.VoidType(),
+    parallel_for_ty = ir.FunctionType(return_ty,
                                       [byte_ptr_t] * 5 + [intp_t, ] * 3)
+    dispatch_name = ('pycc_tbb_parallel_for' if ctx.aot_mode else
+                     'numba_parallel_for')
     parallel_for = cgutils.get_or_insert_function(mod, parallel_for_ty,
-                                                  'numba_parallel_for')
+                                                  dispatch_name)
 
     # Reference inner-function and link
     innerfunc_fnty = ir.FunctionType(
@@ -151,25 +156,22 @@ def build_gufunc_kernel(library, ctx, info, sig, inner_ndim):
                                                  info.name,)
     wrapperlib.add_linking_library(info.library)
 
-    get_num_threads = cgutils.get_or_insert_function(
-        builder.module,
-        ir.FunctionType(ir.IntType(types.intp.bitwidth), []),
-        "get_num_threads")
-
-    num_threads = builder.call(get_num_threads, [])
+    num_threads = _emit_get_num_threads(ctx, builder)
 
     # Prepare call
     fnptr = builder.bitcast(tmp_voidptr, byte_ptr_t)
     innerargs = [as_void_ptr(x) for x
                  in [args, dimensions, steps, data]]
-    builder.call(parallel_for, [fnptr] + innerargs +
-                 [intp_t(x) for x in (inner_ndim, array_count)] + [num_threads])
+    result = builder.call(
+        parallel_for, [fnptr] + innerargs +
+        [intp_t(x) for x in (inner_ndim, array_count)] + [num_threads])
 
-    # Release the GIL
-    pyapi.restore_thread(thread_state)
-    pyapi.gil_release(gil_state)
-
-    builder.ret_void()
+    if ctx.aot_mode:
+        builder.ret(result)
+    else:
+        pyapi.restore_thread(thread_state)
+        pyapi.gil_release(gil_state)
+        builder.ret_void()
 
     wrapperlib.add_ir_module(mod)
     wrapperlib.add_linking_library(library)
@@ -673,15 +675,19 @@ def ol_get_num_threads():
     return impl
 
 
+def _emit_get_num_threads(context, builder):
+    name = "pycc_tbb_get_num_threads" if context.aot_mode else "get_num_threads"
+    fnty = ir.FunctionType(cgutils.intp_t, [])
+    fn = cgutils.get_or_insert_function(builder.module, fnty, name)
+    return builder.call(fn, [])
+
+
 @intrinsic
 def _iget_num_threads(typingctx):
-    _launch_threads()
-
     def codegen(context, builder, signature, args):
-        mod = builder.module
-        fnty = ir.FunctionType(cgutils.intp_t, [])
-        fn = cgutils.get_or_insert_function(mod, fnty, "get_num_threads")
-        return builder.call(fn, [])
+        if not context.aot_mode:
+            _launch_threads()
+        return _emit_get_num_threads(context, builder)
     return signature(types.intp), codegen
 
 
@@ -712,7 +718,8 @@ def _iget_thread_id(typingctx):
     def codegen(context, builder, signature, args):
         mod = builder.module
         fnty = ir.FunctionType(cgutils.intp_t, [])
-        fn = cgutils.get_or_insert_function(mod, fnty, "get_thread_id")
+        name = "pycc_tbb_get_thread_id" if context.aot_mode else "get_thread_id"
+        fn = cgutils.get_or_insert_function(mod, fnty, name)
         return builder.call(fn, [])
     return signature(types.intp), codegen
 

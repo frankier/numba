@@ -3,7 +3,6 @@ from setuptools.command import build_ext
 from setuptools.extension import Extension
 
 import os
-import shutil
 import sys
 import tempfile
 
@@ -80,6 +79,7 @@ class CC(object):
         self._output_file = self._toolchain.get_ext_filename(extension_name)
         self._use_nrt = True
         self._target_cpu = ''
+        self._parallel = False
 
     @property
     def name(self):
@@ -130,6 +130,17 @@ class CC(object):
         self._target_cpu = value
 
     @property
+    def parallel(self):
+        """Enable parallel compilation and link the extension with oneTBB."""
+        return self._parallel
+
+    @parallel.setter
+    def parallel(self, value):
+        if not isinstance(value, bool):
+            raise TypeError("parallel must be a bool")
+        self._parallel = value
+
+    @property
     def verbose(self):
         """
         Whether to display detailed information when compiling.
@@ -166,12 +177,15 @@ class CC(object):
         mixin_sources = self._mixin_sources[:]
         if self._use_nrt:
             mixin_sources.append('../core/runtime/nrt.cpp')
+        if self.parallel:
+            mixin_sources.extend(('../np/ufunc/tbbpool.cpp',
+                                  '../np/ufunc/gufunc_scheduler.cpp'))
         return [os.path.join(here, f) for f in mixin_sources]
 
     def _get_mixin_defines(self):
         # Macro definitions required by modulemixin.c
         from numba import _helperlib
-        return [
+        defines = [
             ('PYCC_MODULE_NAME', self._basename),
             ('PYCC_USE_NRT', int(self._use_nrt)),
             # modulemixin.c #includes _helperlib.c -> _lapack.c, whose Fortran
@@ -184,12 +198,31 @@ class CC(object):
             ('NUMBA_LAPACK_BUILD_ILP64',
              int(getattr(_helperlib, "LAPACK_BUILD_ILP64", 0))),
             ]
+        if self.parallel:
+            defines.append(('PYCC_TBB', 1))
+        return defines
 
     def _get_extra_cflags(self):
         extra_cflags = self._extra_cflags.get(sys.platform, [])
         if not extra_cflags:
             extra_cflags = self._extra_cflags.get(os.name, [])
+        if self.parallel and os.name == 'posix':
+            extra_cflags = extra_cflags + ['-fvisibility=hidden']
         return extra_cflags
+
+    def _get_tbb_options(self):
+        if not self.parallel:
+            return [], [], []
+
+        default_root = (os.path.join(sys.prefix, 'Library')
+                        if os.name == 'nt' else sys.prefix)
+        root = os.environ.get('TBBROOT') or default_root
+        include_dirs = [os.path.join(root, 'include')]
+        library_dirs = [os.path.join(root, 'lib', *parts) for parts in
+                        ((), ('intel64', 'gcc4.4'), ('intel64', 'gcc4.8'),
+                         ('intel64', 'vc_mt'))]
+        libraries = ['tbb12' if os.name == 'nt' else 'tbb']
+        return include_dirs, [d for d in library_dirs if os.path.isdir(d)], libraries
 
     def _get_extra_ldflags(self):
         extra_ldflags = self._extra_ldflags.get(sys.platform, [])
@@ -205,6 +238,8 @@ class CC(object):
         sources = self._get_mixin_sources()
         macros = self._get_mixin_defines()
         include_dirs = self._toolchain.get_python_include_dirs()
+        tbb_includes, _, _ = self._get_tbb_options()
+        include_dirs += tbb_includes
 
         extra_cflags = self._get_extra_cflags()
         # XXX distutils creates a whole subtree inside build_dir,
@@ -218,7 +253,8 @@ class CC(object):
     @global_compiler_lock
     def _compile_object_files(self, build_dir):
         compiler = ModuleCompiler(self._export_entries, self._basename,
-                                self._use_nrt, cpu_name=self._target_cpu)
+                                self._use_nrt, cpu_name=self._target_cpu,
+                                parallel=self.parallel)
         compiler.external_init_function = self._init_function
         temp_obj = os.path.join(build_dir,
                                 os.path.splitext(self._output_file)[0] + '.o')
@@ -233,25 +269,20 @@ class CC(object):
         Compile the extension module.
         """
         self._toolchain.verbose = self.verbose
-        build_dir = tempfile.mkdtemp(prefix='pycc-build-%s-' % self._basename)
+        with tempfile.TemporaryDirectory(
+                prefix='pycc-build-%s-' % self._basename) as build_dir:
+            objects, dll_exports = self._compile_object_files(build_dir)
+            objects += self._compile_mixins(build_dir)
 
-        # Compile object file
-        objects, dll_exports = self._compile_object_files(build_dir)
-
-        # Compile mixins
-        objects += self._compile_mixins(build_dir)
-
-        # Then create shared library
-        extra_ldflags = self._get_extra_ldflags()
-        output_dll = os.path.join(self._output_dir, self._output_file)
-        libraries = self._toolchain.get_python_libraries()
-        library_dirs = self._toolchain.get_python_library_dirs()
-        self._toolchain.link_shared(output_dll, objects,
-                                    libraries, library_dirs,
-                                    export_symbols=dll_exports,
-                                    extra_ldflags=extra_ldflags)
-
-        shutil.rmtree(build_dir)
+            extra_ldflags = self._get_extra_ldflags()
+            output_dll = os.path.join(self._output_dir, self._output_file)
+            _, tbb_lib_dirs, tbb_libs = self._get_tbb_options()
+            libraries = self._toolchain.get_python_libraries() + tbb_libs
+            library_dirs = tbb_lib_dirs + self._toolchain.get_python_library_dirs()
+            self._toolchain.link_shared(
+                output_dll, objects, libraries, library_dirs,
+                export_symbols=dll_exports, extra_ldflags=extra_ldflags,
+                target_lang='c++' if self.parallel else None)
 
     def distutils_extension(self, **kwargs):
         """
@@ -264,12 +295,14 @@ class CC(object):
                               + self._get_extra_cflags())
         extra_link_args = (kwargs.pop('extra_link_args', [])
                            + self._get_extra_ldflags())
+        tbb_includes, tbb_lib_dirs, tbb_libs = self._get_tbb_options()
         include_dirs = (kwargs.pop('include_dirs', [])
-                        + self._toolchain.get_python_include_dirs())
+                        + self._toolchain.get_python_include_dirs()
+                        + tbb_includes)
         libraries = (kwargs.pop('libraries', [])
-                     + self._toolchain.get_python_libraries())
+                     + self._toolchain.get_python_libraries() + tbb_libs)
         library_dirs = (kwargs.pop('library_dirs', [])
-                        + self._toolchain.get_python_library_dirs())
+                        + tbb_lib_dirs + self._toolchain.get_python_library_dirs())
         python_package_path = self._source_module[:self._source_module.rfind('.')+1]
 
         ext = _CCExtension(name=python_package_path + self._basename,

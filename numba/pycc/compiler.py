@@ -11,6 +11,7 @@ from numba.pycc import llvm_types as lt
 from numba.core.cgutils import create_constant_array
 from numba.core.compiler import compile_extra, Flags
 from numba.core.compiler_lock import global_compiler_lock
+from numba.core.cpu_options import ParallelOptions
 
 from numba.core.registry import cpu_target
 from numba.core.runtime import nrtdynmod
@@ -110,7 +111,7 @@ class _ModuleCompiler(object):
                                        lt._int32))
     env_def_ptr = ir.PointerType(env_def_ty)
 
-    def __init__(self, export_entries, module_name, use_nrt=False,
+    def __init__(self, export_entries, module_name, use_nrt=False, parallel=False,
                  **aot_options):
         self.module_name = module_name
         self.export_python_wrap = False
@@ -119,6 +120,7 @@ class _ModuleCompiler(object):
         # Used by the CC API but not the legacy API
         self.external_init_function = None
         self.use_nrt = use_nrt
+        self.parallel = parallel
 
         self.typing_context = cpu_target.typing_context
         self.context = cpu_target.target_context.with_aot_codegen(
@@ -148,6 +150,7 @@ class _ModuleCompiler(object):
         # Generate IR for all exported functions
         flags = Flags()
         flags.no_compile = True
+        flags.auto_parallel = ParallelOptions(self.parallel)
         if not self.export_python_wrap:
             flags.no_cpython_wrapper = True
             flags.no_cfunc_wrapper = True

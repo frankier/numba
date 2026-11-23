@@ -21,6 +21,11 @@ Implement parallel vectorize workqueue on top of Intel TBB.
 
 #include "gufunc_scheduler.h"
 
+#ifdef PYCC_TBB
+#include <cerrno>
+#include <climits>
+#endif
+
 /* TBB 2021.6 is the minimum version */
 #if (TBB_INTERFACE_VERSION < 12060)
 #error "TBB version is incompatible, 2021.6 or greater required, i.e. TBB_INTERFACE_VERSION >= 12060"
@@ -29,10 +34,12 @@ Implement parallel vectorize workqueue on top of Intel TBB.
 #define _DEBUG 0
 #define _TRACE_SPLIT 0
 
+#ifndef PYCC_TBB
 static tbb::task_group *tg = NULL;
 
 static tbb::task_scheduler_handle tsh;
 static bool tsh_was_initialized = false;
+#endif
 
 #ifdef _MSC_VER
 #define THREAD_LOCAL(ty) __declspec(thread) ty
@@ -99,6 +106,7 @@ void fix_tls_observer::on_scheduler_entry(bool worker) {
     set_num_threads(mask_val);
 }
 
+#ifndef PYCC_TBB
 static void
 add_task(void *fn, void *args, void *dims, void *steps, void *data)
 {
@@ -108,6 +116,7 @@ add_task(void *fn, void *args, void *dims, void *steps, void *data)
         func(args, dims, steps, data);
     });
 }
+#endif
 
 static void
 parallel_for(void *fn, char **args, size_t *dimensions, size_t *steps, void *data,
@@ -205,6 +214,74 @@ parallel_for(void *fn, char **args, size_t *dimensions, size_t *steps, void *dat
     });
 }
 
+#ifdef PYCC_TBB
+extern "C" int pycc_tbb_init(void)
+{
+    const char *value = getenv("NUMBA_NUM_THREADS");
+    if (value == NULL) {
+        _INIT_NUM_THREADS = tbb::info::default_concurrency();
+        return 0;
+    }
+
+    char *end;
+    errno = 0;
+    long count = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || errno == ERANGE ||
+        count < 1 || count > INT_MAX) {
+        PyErr_SetString(PyExc_ValueError,
+                        "NUMBA_NUM_THREADS must be a positive int");
+        return -1;
+    }
+    _INIT_NUM_THREADS = static_cast<int>(count);
+    return 0;
+}
+
+extern "C" intp pycc_tbb_get_num_threads(void)
+{
+    return get_num_threads();
+}
+
+extern "C" intp pycc_tbb_get_thread_id(void)
+{
+    return get_thread_id();
+}
+
+extern "C" void pycc_tbb_save_error(PyObject **error)
+{
+    if (!PyErr_Occurred()) {
+        PyErr_SetString(PyExc_RuntimeError, "pycc parallel worker failed");
+    }
+    if (error[0] == NULL) {
+        PyErr_Fetch(error, error + 1, error + 2);
+    } else {
+        PyErr_Clear();
+    }
+}
+
+extern "C" int pycc_tbb_parallel_for(
+    void *fn, char **args, size_t *dims, size_t *steps, void *,
+    size_t inner_ndim, size_t array_count, intp num_threads)
+{
+    PyObject *error[3] = {};
+    PyGILState_STATE gil = PyGILState_Ensure();
+    PyThreadState *thread_state = PyEval_SaveThread();
+    bool dispatch_failed = false;
+    try {
+        parallel_for(fn, args, dims, steps, error, inner_ndim, array_count,
+                     static_cast<int>(num_threads));
+    } catch (...) {
+        dispatch_failed = true;
+    }
+    PyEval_RestoreThread(thread_state);
+    if (error[0] != NULL) {
+        PyErr_Restore(error[0], error[1], error[2]);
+    } else if (dispatch_failed) {
+        PyErr_SetString(PyExc_RuntimeError, "pycc oneTBB dispatch failed");
+    }
+    PyGILState_Release(gil);
+    return dispatch_failed || error[0] != NULL;
+}
+#else
 static std::thread::id init_thread_id;
 static THREAD_LOCAL(bool) need_reinit_after_fork = false;
 
@@ -347,3 +424,4 @@ MOD_INIT(tbbpool)
 
     return MOD_SUCCESS_VAL(m);
 }
+#endif

@@ -446,6 +446,8 @@ metadata = dict(
         # Some C files are needed by pycc
         "numba": ["*.c", "*.h", "py.typed"],
         "numba.pycc": ["*.c", "*.h"],
+        "numba.np.ufunc": ["tbbpool.cpp", "gufunc_scheduler.cpp",
+                          "gufunc_scheduler.h", "workqueue.h"],
         "numba.core.runtime": ["*.cpp", "*.c", "*.h"],
         "numba.cext": ["*.c", "*.h"],
         # numba gdb hook init command language file

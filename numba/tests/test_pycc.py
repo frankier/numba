@@ -189,6 +189,85 @@ class TestCC(BasePYCCTest):
             self.assertPreciseEqual(res, 123 * 321)
             self.assertEqual(lib.multi.__module__, 'pycc_test_simple')
 
+    @unittest.skipUnless(os.environ.get('TBBROOT'), 'requires a oneTBB SDK')
+    def test_parallel_tbb(self):
+        build_script = textwrap.dedent("""\
+            import sys
+            from numba import prange
+            from numba.np.ufunc.parallel import _iget_num_threads, _iget_thread_id
+            from numba.pycc import CC
+
+            cc = CC('pycc_tbb_test')
+            cc.parallel = True
+
+            @cc.export('sum_array', 'i8(i8[::1], i8)')
+            def sum_array(a, start):
+                total = 0
+                for i in prange(start, a.size):
+                    total += a[i]
+                return total
+
+            @cc.export('mark_workers', 'void(i8[::1], i8[::1])')
+            def mark_workers(ids, limits):
+                for i in prange(ids.size):
+                    ids[i] = _iget_thread_id()
+                    limits[i] = _iget_num_threads()
+
+            mode, cc.output_dir = sys.argv[1:]
+            if mode == 'setuptools':
+                from setuptools import setup
+                setup(name='pycc_tbb_test',
+                      ext_modules=[cc.distutils_extension()],
+                      script_args=['build_ext', '--build-lib', cc.output_dir,
+                                   '--build-temp', 'build'])
+            else:
+                cc.compile()
+            """)
+        script_path = os.path.join(self.tmpdir, 'build_parallel.py')
+        with open(script_path, 'w') as f:
+            f.write(build_script)
+
+        runtime_script = textwrap.dedent("""\
+            import sys
+            from concurrent.futures import ThreadPoolExecutor
+            import numpy as np
+
+            sys.modules['numba'] = sys.modules['llvmlite'] = None
+            import pycc_tbb_test as lib
+
+            a = np.arange(4096, dtype=np.int64)
+            assert lib.sum_array(a, 0) == a.sum()
+            assert lib.sum_array(a, -2) == a.sum() + a[-2:].sum()
+            assert lib.sum_array(a[:0], 0) == 0
+            ids, limits = np.empty_like(a), np.empty_like(a)
+            lib.mark_workers(ids, limits)
+            assert np.all((ids >= 0) & (ids < 2))
+            assert np.all(limits == 2)
+            try:
+                lib.sum_array(a, -a.size - 1)
+            except IndexError:
+                pass
+            else:
+                raise AssertionError('worker IndexError was lost')
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                totals = pool.map(lib.sum_array, [a, a], [0, 0])
+                assert list(totals) == [a.sum(), a.sum()]
+            """)
+        env = dict(os.environ, NUMBA_BOUNDSCHECK='1', NUMBA_NUM_THREADS='2',
+                   NUMBA_THREADING_LAYER='invalid-for-pycc-test')
+        repo_root = os.path.dirname(os.path.dirname(base_path))
+        env['PYTHONPATH'] = os.pathsep.join(
+            p for p in (repo_root, env.get('PYTHONPATH')) if p)
+        for mode in ('direct', 'setuptools'):
+            with self.subTest(mode=mode):
+                output_dir = os.path.join(self.tmpdir, mode)
+                os.mkdir(output_dir)
+                subprocess.check_call(
+                    [sys.executable, script_path, mode, output_dir],
+                    env=env, cwd=self.tmpdir)
+                subprocess.check_call([sys.executable, '-c', runtime_script],
+                                      env=env, cwd=output_dir)
+
     def test_compile_for_cpu(self):
         # Compiling for the host CPU should always succeed
         self.check_compile_for_cpu(ll.get_host_cpu_name())

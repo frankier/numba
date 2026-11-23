@@ -228,11 +228,15 @@ class TestCC(BasePYCCTest):
             f.write(build_script)
 
         runtime_script = textwrap.dedent("""\
+            import os
             import sys
             from concurrent.futures import ThreadPoolExecutor
             import numpy as np
 
             sys.modules['numba'] = sys.modules['llvmlite'] = None
+            if sys.platform == 'win32':
+                tbb_dll_dir = os.add_dll_directory(
+                    os.path.join(os.environ['TBBROOT'], 'bin'))
             import pycc_tbb_test as lib
 
             a = np.arange(4096, dtype=np.int64)

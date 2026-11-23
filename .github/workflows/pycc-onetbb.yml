@@ -1,0 +1,67 @@
+name: pycc oneTBB
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/pycc-onetbb.yml
+      - numba/np/ufunc/**
+      - numba/parfors/**
+      - numba/pycc/**
+      - numba/tests/test_pycc.py
+      - setup.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pycc oneTBB (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, windows-2025]
+    defaults:
+      run:
+        shell: bash -el {0}
+    env:
+      NUMBA_DISABLE_TBB: "1"
+      NUMBA_DISABLE_OPENMP: "1"
+      PYTHONFAULTHANDLER: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
+        with:
+          miniforge-version: latest
+          activate-environment: pycc-ci
+          python-version: "3.14"
+          channels: conda-forge
+          channel-priority: strict
+      - name: Install build dependencies
+        run: |
+          conda install -y numpy=2.4 tbb-devel setuptools pip
+          python -m pip install --index-url https://pypi.anaconda.org/numba/label/dev/simple/ llvmlite==0.51.0.dev2
+      - name: Build Numba and test the oneTBB pycc extension
+        run: |
+          export TBBROOT="$(python -c 'import os, sys; from pathlib import Path; print(Path(sys.prefix) / "Library" if os.name == "nt" else Path(sys.prefix))')"
+          case "$RUNNER_OS" in
+            Linux) export LD_LIBRARY_PATH="$TBBROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+            macOS) export DYLD_LIBRARY_PATH="$TBBROOT/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" ;;
+          esac
+          python setup.py build_ext --inplace
+          python - <<'PY'
+          import unittest
+
+          suite = unittest.defaultTestLoader.loadTestsFromName(
+              "numba.tests.test_pycc.TestCC.test_parallel_tbb")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(not result.wasSuccessful() or bool(result.skipped))
+          PY

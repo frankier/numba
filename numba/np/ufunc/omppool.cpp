@@ -13,7 +13,7 @@ Threading layer on top of OpenMP.
 #include <string.h>
 #include <stdio.h>
 #include "workqueue.h"
-#include "gufunc_scheduler.h"
+#include "parallel_runtime.h"
 
 #ifdef _WIN32
 #include <malloc.h>
@@ -41,7 +41,7 @@ Threading layer on top of OpenMP.
 #define _OMP_VENDOR "GNU"
 #endif
 
-#if defined(_NOT_FORKSAFE)
+#if defined(_NOT_FORKSAFE) || (defined(PYCC_PARALLEL) && !defined(_WIN32))
 static pid_t parent_pid = 0; // 0 is not set, users can't own this anyway
 #endif
 
@@ -85,6 +85,7 @@ get_thread_id(void)
     return omp_get_thread_num();
 }
 
+#ifndef PYCC_PARALLEL
 static void
 add_task(void *fn, void *args, void *dims, void *steps, void *data)
 {
@@ -93,10 +94,12 @@ add_task(void *fn, void *args, void *dims, void *steps, void *data)
     func_ptr_t func = reinterpret_cast<func_ptr_t>(fn);
     func(args, dims, steps, data);
 }
+#endif
 
 static void
-parallel_for(void *fn, char **args, size_t *dimensions, size_t *steps, void *data,
-             size_t inner_ndim, size_t array_count, int num_threads)
+parallel_for_impl(void *fn, char **args, size_t *dimensions, size_t *steps, void *data,
+                  size_t inner_ndim, size_t array_count, int num_threads,
+                  bool dynamic)
 {
     typedef void (*func_ptr_t)(char **args, size_t *dims, size_t *steps, void *data);
     func_ptr_t func = reinterpret_cast<func_ptr_t>(fn);
@@ -107,7 +110,7 @@ parallel_for(void *fn, char **args, size_t *dimensions, size_t *steps, void *dat
         printed = true;
     }
 
-#if defined(_NOT_FORKSAFE)
+#if defined(_NOT_FORKSAFE) && !defined(PYCC_PARALLEL)
     // Handle GNU OpenMP not being forksafe...
     // This checks if the pid set by the process that initialized this library
     // matches the parent of this pid. If they do match this is a fork() from
@@ -164,12 +167,10 @@ parallel_for(void *fn, char **args, size_t *dimensions, size_t *steps, void *dat
         size_t * count_space = (size_t *)alloca(sizeof(size_t) * arg_len);
         char ** array_arg_space = (char**)alloca(sizeof(char*) * array_count);
 
-        // tell the active thread team about the number of threads
+        const int saved_mask = _TLS_num_threads;
         set_num_threads(agreed_nthreads);
 
-        #pragma omp for
-        for(ptrdiff_t r = 0; r < size; r++)
-        {
+        auto run_chunk = [&](ptrdiff_t r) {
             memcpy(count_space, dimensions, arg_len * sizeof(size_t));
             count_space[0] = 1;
 
@@ -206,9 +207,40 @@ parallel_for(void *fn, char **args, size_t *dimensions, size_t *steps, void *dat
                 printf("\n");
             }
             func(array_arg_space, count_space, steps, data);
+        };
+
+        if (dynamic) {
+            #pragma omp for schedule(dynamic, 1)
+            for (ptrdiff_t r = 0; r < size; r++) {
+                run_chunk(r);
+            }
+        } else {
+            #pragma omp for schedule(static)
+            for (ptrdiff_t r = 0; r < size; r++) {
+                run_chunk(r);
+            }
         }
+        set_num_threads(saved_mask);
     }
 }
+
+static void
+dispatch_parfor(void *fn, char **args, size_t *dims, size_t *steps, void *data,
+                size_t inner_ndim, size_t array_count, int count)
+{
+    parallel_for_impl(fn, args, dims, steps, data, inner_ndim, array_count,
+                      count, get_parallel_chunksize() != 0);
+}
+
+#ifndef PYCC_PARALLEL
+static void
+parallel_for(void *fn, char **args, size_t *dims, size_t *steps, void *data,
+             size_t inner_ndim, size_t array_count, int count)
+{
+    parallel_for_impl(fn, args, dims, steps, data, inner_ndim, array_count,
+                      count, false);
+}
+#endif
 
 // Look up `name` in any library already loaded into this process. Returns
 // NULL if the symbol is not present, or if the symbol's value is NULL (the
@@ -281,7 +313,7 @@ static void launch_threads(int count)
 {
     // this must be called in a fork+thread safe region from Python
     static bool initialized = false;
-#ifdef _NOT_FORKSAFE
+#if defined(_NOT_FORKSAFE) || (defined(PYCC_PARALLEL) && !defined(_WIN32))
     parent_pid = getpid(); // record the parent PID for use later
     if(_DEBUG_FORK)
     {
@@ -324,6 +356,25 @@ static void launch_threads(int count)
     _INIT_NUM_THREADS = count;
 }
 
+static const char *fork_error(void)
+{
+#if defined(PYCC_PARALLEL) && !defined(_WIN32)
+    if (parent_pid != getpid()) {
+        return "Numba cannot use OpenMP in this forked child; use spawn";
+    }
+#endif
+    return NULL;
+}
+
+int numba_parallel_init(int count)
+{
+    launch_threads(count);
+    return 0;
+}
+
+NUMBA_DEFINE_PARALLEL_BACKEND(omp_get_max_threads(), fork_error(), dispatch_parfor)
+
+#ifndef PYCC_PARALLEL
 static void synchronize(void)
 {
 }
@@ -339,6 +390,7 @@ MOD_INIT(omppool)
     if (m == NULL)
         return MOD_ERROR_VAL;
 
+    NUMBA_PARALLEL_SYMBOLS(m);
     SetAttrStringFromVoidPointer(m, launch_threads);
     SetAttrStringFromVoidPointer(m, synchronize);
     SetAttrStringFromVoidPointer(m, ready);
@@ -361,3 +413,4 @@ MOD_INIT(omppool)
 
     return MOD_SUCCESS_VAL(m);
 }
+#endif

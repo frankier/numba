@@ -129,6 +129,10 @@ class Toolchain(object):
             msg = "Unknown platform %s" % plt
         raise RuntimeError(msg)
 
+    @property
+    def compiler_type(self):
+        return self._compiler.compiler_type
+
     def compile_objects(self, sources, output_dir,
                         include_dirs=(), depends=(), macros=(),
                         extra_cflags=None):
@@ -153,7 +157,7 @@ class Toolchain(object):
 
     def link_shared(self, output, objects, libraries=(),
                     library_dirs=(), export_symbols=(),
-                    extra_ldflags=None):
+                    extra_ldflags=None, target_lang=None):
         """
         Create a shared library *output* linking the given *objects*
         and *libraries* (all strings).
@@ -163,7 +167,8 @@ class Toolchain(object):
                             output_filename, output_dir,
                             libraries, library_dirs,
                             export_symbols=export_symbols,
-                            extra_preargs=extra_ldflags)
+                            extra_preargs=extra_ldflags,
+                            target_lang=target_lang)
 
     def get_python_libraries(self):
         """

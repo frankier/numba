@@ -236,6 +236,11 @@ def get_ext_modules():
                                          )
 
     ext_np_ufunc_backends = []
+    parallel_sources = ['numba/np/ufunc/gufunc_scheduler.cpp',
+                        'numba/np/ufunc/parallel_runtime.cpp']
+    parallel_headers = ['numba/np/ufunc/workqueue.h',
+                        'numba/np/ufunc/parallel_runtime.h',
+                        'numba/np/ufunc/gufunc_scheduler.h']
 
     def check_file_at_path(path2file):
         """
@@ -324,11 +329,8 @@ def get_ext_modules():
             print("Using Intel TBB from:", tbb_root)
             ext_np_ufunc_tbb_backend = Extension(
                 name='numba.np.ufunc.tbbpool',
-                sources=[
-                    'numba/np/ufunc/tbbpool.cpp',
-                    'numba/np/ufunc/gufunc_scheduler.cpp',
-                ],
-                depends=['numba/np/ufunc/workqueue.h'],
+                sources=['numba/np/ufunc/tbbpool.cpp'] + parallel_sources,
+                depends=parallel_headers,
                 include_dirs=[os.path.join(tbb_root, 'include')],
                 extra_compile_args=cpp11flags,
                 extra_link_args=extra_link_args,
@@ -354,11 +356,8 @@ def get_ext_modules():
         # OpenMP backed work queue
         ext_np_ufunc_omppool_backend = Extension(
             name='numba.np.ufunc.omppool',
-            sources=[
-                'numba/np/ufunc/omppool.cpp',
-                'numba/np/ufunc/gufunc_scheduler.cpp',
-            ],
-            depends=['numba/np/ufunc/workqueue.h'],
+            sources=['numba/np/ufunc/omppool.cpp'] + parallel_sources,
+            depends=parallel_headers,
             extra_compile_args=ompcompileflags + cpp11flags,
             extra_link_args=omplinkflags,
         )
@@ -371,9 +370,8 @@ def get_ext_modules():
     # version is built. Users can select a backend via env vars.
     ext_np_ufunc_workqueue_backend = Extension(
         name='numba.np.ufunc.workqueue',
-        sources=['numba/np/ufunc/workqueue.c',
-                 'numba/np/ufunc/gufunc_scheduler.cpp'],
-        depends=['numba/np/ufunc/workqueue.h'],
+        sources=['numba/np/ufunc/workqueue.c'] + parallel_sources,
+        depends=parallel_headers,
         extra_link_args=extra_link_args)
     ext_np_ufunc_backends.append(ext_np_ufunc_workqueue_backend)
 
@@ -446,6 +444,9 @@ metadata = dict(
         # Some C files are needed by pycc
         "numba": ["*.c", "*.h", "py.typed"],
         "numba.pycc": ["*.c", "*.h"],
+        "numba.np.ufunc": ["tbbpool.cpp", "omppool.cpp", "gufunc_scheduler.cpp",
+                          "gufunc_scheduler.h", "workqueue.h",
+                          "parallel_runtime.cpp", "parallel_runtime.h"],
         "numba.core.runtime": ["*.cpp", "*.c", "*.h"],
         "numba.cext": ["*.c", "*.h"],
         # numba gdb hook init command language file

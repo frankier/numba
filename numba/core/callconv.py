@@ -490,24 +490,16 @@ class CPUCallConv(BaseCallConv):
         fn = builder.bitcast(func_ptr, fnty.as_pointer())
         py_tuple = builder.call(fn, [dyn_args])
 
-        # We check at this stage if creating the Python tuple was successful
-        # or not. Note the exception is raised by calling PyErr_SetString
-        # directly as the current function is the CPython wrapper.
+        # Keep control in the wrapper so it can report the error and release
+        # the GIL even if boxing a worker's exception failed.
         failed = cgutils.is_null(builder, py_tuple)
-        with cgutils.if_unlikely(builder, failed):
-            msg = ('Error creating Python tuple from runtime exception '
-                   'arguments')
-            pyapi.err_set_string("PyExc_RuntimeError", msg)
-            # Return NULL to indicate an error was raised
-            fnty = builder.function.function_type
-            if not isinstance(fnty.return_type, ir.VoidType):
-                # in some ufuncs, the return type is void
-                builder.ret(cgutils.get_null_value(fnty.return_type))
-            else:
-                builder.ret_void()
-
-        # merge static and dynamic variables
-        excinfo = pyapi.build_dynamic_excinfo_struct(static_exc_bytes, py_tuple)
+        failure = builder.or_(failed, cgutils.is_null(builder, static_exc_bytes))
+        result = cgutils.alloca_once_value(builder, cgutils.get_null_value(PYOBJECT))
+        with builder.if_then(builder.not_(failure), likely=True):
+            excinfo = pyapi.build_dynamic_excinfo_struct(static_exc_bytes, py_tuple)
+            builder.store(excinfo, result)
+        pyapi.decref(static_exc_bytes)
+        pyapi.decref(py_tuple)
 
         # At this point, one can free the entire excinfo_ptr struct
         if self.context.enable_nrt:
@@ -515,7 +507,7 @@ class CPUCallConv(BaseCallConv):
             # if its in a dynamic exception branch
             self.context.nrt.free(
                 builder, builder.bitcast(excinfo_ptr, pyapi.voidptr))
-        return excinfo
+        return builder.load(result)
 
     def unpack_exception(self, builder, pyapi, status):
         # Emit code that checks the alloc flag (last excinfo member)
@@ -601,9 +593,15 @@ class CPUCallConv(BaseCallConv):
         self.context.nrt.free(builder,
                               self._get_return_argument(builder.function))
 
-        # Create a tuple of CPython objects
-        tup = pyapi.tuple_pack(objs)
-        builder.ret(tup)
+        result = cgutils.alloca_once_value(builder, cgutils.get_null_value(PYOBJECT))
+        failed = cgutils.false_bit
+        for obj in objs:
+            failed = builder.or_(failed, cgutils.is_null(builder, obj))
+        with builder.if_then(builder.not_(failed), likely=True):
+            builder.store(pyapi.tuple_pack(objs), result)
+        for obj in objs:
+            pyapi.decref(obj)
+        builder.ret(builder.load(result))
 
         return fn
 
@@ -686,10 +684,11 @@ class CPUCallConv(BaseCallConv):
 
         # serialize comp. time args
         pyapi = self.context.get_python_api(builder)
-        dummy = self.context.get_dummy_value()
-        exc_args_static = tuple(
-            [dummy if isinstance(arg, ir.Value) else arg for arg in exc_args])
+        dynamic = tuple(isinstance(arg, ir.Value) for arg in exc_args)
+        exc_args_static = tuple(None if dyn else arg
+                                for dyn, arg in zip(dynamic, exc_args))
         exc = self.build_excinfo_struct(exc, exc_args_static, loc, func_name)
+        exc += (dynamic,)
         excinfo_pp = self._get_excinfo_argument(builder.function)
         struct_gv = builder.load(pyapi.serialize_object(exc))
 

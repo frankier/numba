@@ -24,7 +24,7 @@ from itertools import cycle, chain
 import subprocess as subp
 
 import numba.parfors.parfor
-from numba import (njit, prange, parallel_chunksize,
+from numba import (jit, njit, prange, parallel_chunksize,
                    get_parallel_chunksize, set_parallel_chunksize,
                    set_num_threads, get_num_threads, typeof)
 from numba.core import (types, errors, ir, rewrites,
@@ -297,7 +297,7 @@ class TestParforsBase(TestCase):
 
     def check_scheduling(self, cres, scheduler_type):
         # make sure parfor set up scheduling
-        scheduler_str = '@do_scheduling'
+        scheduler_str = '@numba_parallel_schedule'
         if scheduler_type is not None:
             if scheduler_type in ['signed', 'unsigned']:
                 scheduler_str += '_' + scheduler_type
@@ -687,7 +687,7 @@ class TestParforBasic(TestParforsBase):
             return np.ones(())
         with self.assertRaises(AssertionError) as raises:
             self.check(test_impl)
-        self.assertIn("\'@do_scheduling\' not found", str(raises.exception))
+        self.assertIn("\'@numba_parallel_schedule\' not found", str(raises.exception))
 
     def test_simple02(self):
         def test_impl():
@@ -739,7 +739,7 @@ class TestParforBasic(TestParforsBase):
             return np.complex128(1.)
         with self.assertRaises(AssertionError) as raises:
             self.check(test_impl)
-        self.assertIn("\'@do_scheduling\' not found", str(raises.exception))
+        self.assertIn("\'@numba_parallel_schedule\' not found", str(raises.exception))
 
     def test_simple14(self):
         def test_impl():
@@ -780,7 +780,7 @@ class TestParforBasic(TestParforsBase):
         # gemm is left to BLAS
         with self.assertRaises(AssertionError) as raises:
             self.check(test_impl, *self.simple_args)
-        self.assertIn("\'@do_scheduling\' not found", str(raises.exception))
+        self.assertIn("\'@numba_parallel_schedule\' not found", str(raises.exception))
 
     @needs_blas
     def test_simple21(self):
@@ -2189,7 +2189,7 @@ class TestParfors(TestParforsBase):
 
         with self.assertRaises(AssertionError) as raises:
             self.check(test_impl)
-        self.assertIn("\'@do_scheduling\' not found", str(raises.exception))
+        self.assertIn("\'@numba_parallel_schedule\' not found", str(raises.exception))
 
     def test_recursive_untraced_value_tuple(self):
         # This is a test for issue #6478.
@@ -2199,7 +2199,7 @@ class TestParfors(TestParforsBase):
 
         with self.assertRaises(AssertionError) as raises:
             self.check(test_impl)
-        self.assertIn("\'@do_scheduling\' not found", str(raises.exception))
+        self.assertIn("\'@numba_parallel_schedule\' not found", str(raises.exception))
 
     def test_untraced_value_parfor(self):
         # This is a test for issue #6478.
@@ -2423,6 +2423,21 @@ class TestParforsLeaks(MemoryLeakMixin, TestParforsBase):
 
         arr = np.arange(10).astype(np.float64)
         self.check(test_impl, arr)
+
+    def test_worker_error_releases_caller_arrays(self):
+        @jit(parallel=True, boundscheck=True, nogil=True)
+        def sum_array(a, stop):
+            extra = np.ones(4, dtype=np.int64)
+            total = 0
+            for i in prange(stop):
+                total += a[i]
+            return total + extra[0]
+
+        a = np.arange(64)
+        self.assertEqual(sum_array(a, a.size), a.sum() + 1)
+        with self.assertRaises(IndexError):
+            sum_array(a, a.size + 1)
+        self.assertEqual(sum_array(a, a.size), a.sum() + 1)
 
     def test_multiple_reduction_vars(self):
 
@@ -2869,7 +2884,7 @@ class TestParforsBitMask(TestParforsBase):
         # expect failure due to lack of parallelism
         with self.assertRaises(AssertionError) as raises:
             self.check(test_impl, a, b, c)
-        self.assertIn("\'@do_scheduling\' not found", str(raises.exception))
+        self.assertIn("\'@numba_parallel_schedule\' not found", str(raises.exception))
 
 
 @skip_parfors_unsupported
@@ -4763,7 +4778,8 @@ class TestParforsVectorizer(TestPrangeBase):
             asm = self._get_gufunc_asm(cres)
 
             if assertions:
-                schedty = re.compile(r'call\s+\w+\*\s+@do_scheduling_(\w+)\(')
+                schedty = re.compile(
+                    r'call\s+(?:ptr|\w+\*)\s+@numba_parallel_schedule_(\w+)\(')
                 matches = schedty.findall(cres.library.get_llvm_str())
                 self.assertGreaterEqual(len(matches), 1) # at least 1 parfor call
                 self.assertEqual(matches[0], schedule_type)

@@ -2,8 +2,8 @@ from setuptools import distutils as dutils
 from setuptools.command import build_ext
 from setuptools.extension import Extension
 
+from copy import copy
 import os
-import shutil
 import sys
 import tempfile
 
@@ -52,11 +52,16 @@ class CC(object):
         'darwin': ['-Wl,-S'],
         }
 
-    def __init__(self, extension_name, source_module=None):
+    def __init__(self, extension_name, source_module=None, *,
+                 threading_layer="tbb"):
         if '.' in extension_name:
             raise ValueError("basename should be a simple module name, not "
                              "qualified name")
 
+        if threading_layer not in ("tbb", "omp"):
+            raise ValueError("threading_layer must be 'tbb' or 'omp'")
+
+        self._threading_layer = threading_layer
         self._basename = extension_name
         self._init_function = 'pycc_init_' + extension_name
         self._exported_functions = {}
@@ -140,17 +145,21 @@ class CC(object):
     def verbose(self, value):
         self._verbose = value
 
-    def export(self, exported_name, sig):
+    def export(self, exported_name, sig, *, parallel=False):
         """
         Mark a function for exporting in the extension module.
+
+        Set parallel to enable automatic parallelization for this export.
         """
+        if not isinstance(parallel, bool):
+            raise TypeError("parallel must be a bool")
         fn_args, fn_retty = sigutils.normalize_signature(sig)
         sig = typing.signature(fn_retty, *fn_args)
         if exported_name in self._exported_functions:
             raise KeyError("duplicated export symbol %s" % (exported_name))
 
         def decorator(func):
-            entry = ExportEntry(exported_name, sig, func)
+            entry = ExportEntry(exported_name, sig, func, parallel)
             self._exported_functions[exported_name] = entry
             return func
 
@@ -161,17 +170,24 @@ class CC(object):
         return sorted(self._exported_functions.values(),
                       key=lambda entry: entry.symbol)
 
+    def _needs_parallel_runtime(self):
+        return any(entry.parallel for entry in self._export_entries)
+
     def _get_mixin_sources(self):
         here = os.path.dirname(__file__)
         mixin_sources = self._mixin_sources[:]
         if self._use_nrt:
             mixin_sources.append('../core/runtime/nrt.cpp')
+        if self._needs_parallel_runtime():
+            mixin_sources.extend((f'../np/ufunc/{self._threading_layer}pool.cpp',
+                                  '../np/ufunc/gufunc_scheduler.cpp',
+                                  '../np/ufunc/parallel_runtime.cpp'))
         return [os.path.join(here, f) for f in mixin_sources]
 
     def _get_mixin_defines(self):
         # Macro definitions required by modulemixin.c
         from numba import _helperlib
-        return [
+        defines = [
             ('PYCC_MODULE_NAME', self._basename),
             ('PYCC_USE_NRT', int(self._use_nrt)),
             # modulemixin.c #includes _helperlib.c -> _lapack.c, whose Fortran
@@ -184,27 +200,66 @@ class CC(object):
             ('NUMBA_LAPACK_BUILD_ILP64',
              int(getattr(_helperlib, "LAPACK_BUILD_ILP64", 0))),
             ]
+        if self._needs_parallel_runtime():
+            defines.append(('PYCC_PARALLEL', 1))
+        return defines
 
     def _get_extra_cflags(self):
-        extra_cflags = self._extra_cflags.get(sys.platform, [])
-        if not extra_cflags:
-            extra_cflags = self._extra_cflags.get(os.name, [])
-        return extra_cflags
+        flags = list(self._extra_cflags.get(sys.platform)
+                     or self._extra_cflags.get(os.name, []))
+        if not self._needs_parallel_runtime():
+            return flags
+        if os.name == 'posix':
+            flags.append('-fvisibility=hidden')
+        if self._threading_layer == 'omp':
+            if os.name == 'nt' and self._toolchain.compiler_type == 'msvc':
+                flags.append('/openmp')
+            elif sys.platform == 'darwin':
+                flags.extend(['-Xclang', '-fopenmp'])
+            else:
+                flags.append('-fopenmp')
+        return flags
+
+    def _get_parallel_link_options(self):
+        if not self._needs_parallel_runtime():
+            return [], [], []
+
+        default_root = (os.path.join(sys.prefix, 'Library')
+                        if os.name == 'nt' else sys.prefix)
+        if self._threading_layer == 'omp':
+            root = os.environ.get('OPENMP_ROOT') or default_root
+            libraries = ['omp'] if sys.platform == 'darwin' else []
+            if sys.platform.startswith('linux'):
+                libraries.append('dl')
+            subdirs = [('lib',), ('lib64',)]
+        else:
+            root = os.environ.get('TBBROOT') or default_root
+            libraries = ['tbb12' if os.name == 'nt' else 'tbb']
+            subdirs = [('lib',), ('lib64',), ('lib', 'intel64', 'gcc4.4'),
+                       ('lib', 'intel64', 'gcc4.8'), ('lib', 'intel64', 'vc_mt')]
+        library_dirs = [os.path.join(root, *parts) for parts in subdirs]
+        return ([os.path.join(root, 'include')],
+                [path for path in library_dirs if os.path.isdir(path)],
+                libraries)
 
     def _get_extra_ldflags(self):
-        extra_ldflags = self._extra_ldflags.get(sys.platform, [])
-        if not extra_ldflags:
-            extra_ldflags = self._extra_ldflags.get(os.name, [])
+        flags = list(self._extra_ldflags.get(sys.platform)
+                     or self._extra_ldflags.get(os.name, []))
         # helperlib uses pthread on linux. make sure we are linking to it.
-        if sys.platform.startswith("linux"):
-            if "-pthread" not in extra_ldflags:
-                extra_ldflags.append('-pthread')
-        return extra_ldflags
+        if sys.platform.startswith("linux") and "-pthread" not in flags:
+            flags.append('-pthread')
+        if (self._needs_parallel_runtime() and self._threading_layer == 'omp'
+                and sys.platform != 'darwin'
+                and self._toolchain.compiler_type != 'msvc'):
+            flags.append('-fopenmp')
+        return flags
 
     def _compile_mixins(self, build_dir):
         sources = self._get_mixin_sources()
         macros = self._get_mixin_defines()
         include_dirs = self._toolchain.get_python_include_dirs()
+        parallel_includes, _, _ = self._get_parallel_link_options()
+        include_dirs += parallel_includes
 
         extra_cflags = self._get_extra_cflags()
         # XXX distutils creates a whole subtree inside build_dir,
@@ -233,25 +288,20 @@ class CC(object):
         Compile the extension module.
         """
         self._toolchain.verbose = self.verbose
-        build_dir = tempfile.mkdtemp(prefix='pycc-build-%s-' % self._basename)
+        with tempfile.TemporaryDirectory(
+                prefix='pycc-build-%s-' % self._basename) as build_dir:
+            objects, dll_exports = self._compile_object_files(build_dir)
+            objects += self._compile_mixins(build_dir)
 
-        # Compile object file
-        objects, dll_exports = self._compile_object_files(build_dir)
-
-        # Compile mixins
-        objects += self._compile_mixins(build_dir)
-
-        # Then create shared library
-        extra_ldflags = self._get_extra_ldflags()
-        output_dll = os.path.join(self._output_dir, self._output_file)
-        libraries = self._toolchain.get_python_libraries()
-        library_dirs = self._toolchain.get_python_library_dirs()
-        self._toolchain.link_shared(output_dll, objects,
-                                    libraries, library_dirs,
-                                    export_symbols=dll_exports,
-                                    extra_ldflags=extra_ldflags)
-
-        shutil.rmtree(build_dir)
+            extra_ldflags = self._get_extra_ldflags()
+            output_dll = os.path.join(self._output_dir, self._output_file)
+            _, lib_dirs, libs = self._get_parallel_link_options()
+            libraries = self._toolchain.get_python_libraries() + libs
+            library_dirs = lib_dirs + self._toolchain.get_python_library_dirs()
+            self._toolchain.link_shared(
+                output_dll, objects, libraries, library_dirs,
+                export_symbols=dll_exports, extra_ldflags=extra_ldflags,
+                target_lang='c++' if self._needs_parallel_runtime() else None)
 
     def distutils_extension(self, **kwargs):
         """
@@ -264,11 +314,12 @@ class CC(object):
                               + self._get_extra_cflags())
         extra_link_args = (kwargs.pop('extra_link_args', [])
                            + self._get_extra_ldflags())
+        includes, lib_dirs, libs = self._get_parallel_link_options()
         include_dirs = (kwargs.pop('include_dirs', [])
-                        + self._toolchain.get_python_include_dirs())
+                        + self._toolchain.get_python_include_dirs() + includes)
         libraries = (kwargs.pop('libraries', [])
-                     + self._toolchain.get_python_libraries())
-        library_dirs = (kwargs.pop('library_dirs', [])
+                     + self._toolchain.get_python_libraries() + libs)
+        library_dirs = (kwargs.pop('library_dirs', []) + lib_dirs
                         + self._toolchain.get_python_library_dirs())
         python_package_path = self._source_module[:self._source_module.rfind('.')+1]
 
@@ -283,7 +334,8 @@ class CC(object):
                            extra_link_args=extra_link_args,
                            **kwargs)
         ext.monkey_patch_distutils()
-        ext._cc = self
+        ext._cc = copy(self)
+        ext._cc._exported_functions = self._exported_functions.copy()
         return ext
 
 
@@ -298,7 +350,7 @@ class _CCExtension(Extension):
 
     def _prepare_object_files(self, build_ext):
         cc = self._cc
-        dir_util.mkpath(os.path.join(build_ext.build_temp, *self.name.split('.')[:-1]))
+        dir_util.mkpath(build_ext.build_temp)
         objects, _ = cc._compile_object_files(build_ext.build_temp)
         # Add generated object files for linking
         self.extra_objects = objects
@@ -318,9 +370,12 @@ class _CCExtension(Extension):
 
             def build_extension(self, ext):
                 if isinstance(ext, _CCExtension):
-                    ext._prepare_object_files(self)
-
-                _orig_build_ext.build_extension(self, ext)
+                    command = copy(self)
+                    command.build_temp = os.path.join(
+                        self.build_temp, *ext.name.split('.'))
+                    ext._prepare_object_files(command)
+                    return _orig_build_ext.build_extension(command, ext)
+                return _orig_build_ext.build_extension(self, ext)
 
         build_ext.build_ext = _CC_build_ext
 

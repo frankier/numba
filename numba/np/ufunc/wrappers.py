@@ -410,7 +410,8 @@ class _GufuncWrapper(object):
         # Loop
         with cgutils.for_range(builder, loopcount, intp=intp_t) as loop:
             args = [a.get_array_at_offset(loop.index) for a in arrays]
-            innercall, error = self.gen_loop_body(builder, pyapi, func, args)
+            innercall, error = self.gen_loop_body(builder, pyapi, func, args,
+                                                  arg_data)
             # If error, escape
             cgutils.cbranch_or_continue(builder, error, bbreturn)
 
@@ -458,7 +459,7 @@ class _GufuncWrapper(object):
             library=wrapperlib, env=self.env, name=wrapper_name,
         )
 
-    def gen_loop_body(self, builder, pyapi, func, args):
+    def gen_loop_body(self, builder, pyapi, func, args, data):
         status, retval = self.call_conv.call_function(
             builder, func, self.signature.return_type, self.signature.args,
             args)
@@ -466,6 +467,11 @@ class _GufuncWrapper(object):
         with builder.if_then(status.is_error, likely=False):
             gil = pyapi.gil_ensure()
             self.context.call_conv.raise_error(builder, pyapi, status)
+            if self.is_parfors:
+                fnty = ir.FunctionType(ir.VoidType(), [data.type])
+                save_error = cgutils.get_or_insert_function(
+                    builder.module, fnty, "numba_parallel_save_error")
+                builder.call(save_error, [data])
             pyapi.gil_release(gil)
 
         return status.code, status.is_error
@@ -478,7 +484,7 @@ class _GufuncWrapper(object):
 
 
 class _GufuncObjectWrapper(_GufuncWrapper):
-    def gen_loop_body(self, builder, pyapi, func, args):
+    def gen_loop_body(self, builder, pyapi, func, args, data):
         innercall, error = _prepare_call_to_object_mode(self.context,
                                                         builder, pyapi, func,
                                                         self.signature,

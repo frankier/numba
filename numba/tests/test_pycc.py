@@ -189,6 +189,203 @@ class TestCC(BasePYCCTest):
             self.assertPreciseEqual(res, 123 * 321)
             self.assertEqual(lib.multi.__module__, 'pycc_test_simple')
 
+    @unittest.skipUnless(os.environ.get('TBBROOT'), 'requires a oneTBB SDK')
+    def test_parallel_tbb(self):
+        self.check_parallel_backend('tbb')
+
+    @unittest.skipUnless(os.environ.get('NUMBA_TEST_PYCC_OPENMP'),
+                         'requires an OpenMP toolchain')
+    def test_parallel_omp(self):
+        self.check_parallel_backend('omp')
+
+    def check_parallel_backend(self, backend):
+        build_script = textwrap.dedent("""\
+            import sys
+            from numba import (get_num_threads, get_parallel_chunksize,
+                               get_thread_id, jit, prange, set_num_threads,
+                               set_parallel_chunksize)
+            from numba.pycc import CC
+
+            mode, output_dir, backend = sys.argv[1:]
+            cc = CC('pycc_parallel_test', threading_layer=backend)
+            cc.output_dir = output_dir
+
+            @cc.export('sum_array', 'i8(i8[::1], i8)', parallel=True)
+            def sum_array(a, start):
+                total = 0
+                for i in prange(start, a.size):
+                    total += a[i]
+                return total
+
+            @cc.export('mark_workers', 'void(i8[::1], i8[::1])', parallel=True)
+            @cc.export('mark_serial', 'void(i8[::1], i8[::1])')
+            def mark_workers(ids, limits):
+                for i in prange(ids.size):
+                    ids[i] = get_thread_id()
+                    limits[i] = get_num_threads() if get_parallel_chunksize() == 0 else -1
+
+            @cc.export('set_controls', 'uintp(i8, uintp)')
+            def set_controls(threads, chunksize):
+                set_num_threads(threads)
+                return set_parallel_chunksize(chunksize)
+
+            @jit(parallel=True)
+            def sum_helper(a):
+                total = 0
+                for i in prange(a.size):
+                    total += a[i]
+                return total
+
+            @cc.export('sum_via_helper', 'i8(i8[::1])')
+            def sum_via_helper(a):
+                return sum_helper(a)
+
+            if backend == 'omp':
+                @jit(parallel=True)
+                def mark_inner(ids):
+                    for i in prange(ids.size):
+                        ids[i] = get_thread_id()
+
+                @cc.export('mark_nested', 'void(i8[:, ::1])', parallel=True)
+                def mark_nested(ids):
+                    for i in prange(ids.shape[0]):
+                        mark_inner(ids[i])
+
+            @jit
+            def check_value(value):
+                if value < 0:
+                    raise ValueError("negative value", value)
+
+            @cc.export('check_values', 'void(i8[::1])', parallel=True)
+            def check_values(a):
+                for i in prange(a.size):
+                    check_value(a[i])
+
+            if mode == 'setuptools':
+                from setuptools import setup
+                extension = cc.distutils_extension()
+                cc.export('late', 'i8()')(lambda: 0)
+                setup(name='pycc_parallel_test',
+                      ext_modules=[extension],
+                      script_args=['build_ext', '--build-lib', cc.output_dir,
+                                   '--build-temp', 'build'])
+            else:
+                cc.compile()
+            """)
+        script_path = os.path.join(self.tmpdir, 'build_parallel.py')
+        with open(script_path, 'w') as f:
+            f.write(build_script)
+
+        runtime_script = textwrap.dedent("""\
+            import os
+            import sys
+            from concurrent.futures import ThreadPoolExecutor
+            import numpy as np
+
+            sys.modules['numba'] = sys.modules['llvmlite'] = None
+            backend = sys.argv[1]
+            if sys.platform == 'win32' and backend == 'tbb':
+                tbb_dll_dir = os.add_dll_directory(
+                    os.path.join(os.environ['TBBROOT'], 'bin'))
+            import pycc_parallel_test as lib
+
+            a = np.arange(4096, dtype=np.int64)
+            assert lib.sum_array(a, 0) == a.sum()
+            assert lib.sum_array(a, -2) == a.sum() + a[-2:].sum()
+            assert lib.sum_array(a[:0], 0) == 0
+            assert lib.sum_via_helper(a) == a.sum()
+            assert not hasattr(lib, 'late')
+            ids, limits = np.empty_like(a), np.empty_like(a)
+            lib.mark_workers(ids, limits)
+            assert np.all((ids >= 0) & (ids < 2))
+            assert np.all(limits == 2)
+            if backend == 'omp':
+                assert np.any(ids == 1)
+                nested_ids = np.full((2, 1024), -1, dtype=np.int64)
+                lib.mark_nested(nested_ids)
+                assert np.all((nested_ids >= 0) & (nested_ids < 2))
+                if sys.platform.startswith('linux'):
+                    assert np.any(nested_ids == 1)
+
+            assert lib.set_controls(2, 7) == 0
+            lib.mark_workers(ids, limits)
+            assert np.all((ids >= 0) & (ids < 2))
+            assert np.all(limits == 2)
+
+            assert lib.set_controls(1, 7) == 7
+            lib.mark_workers(ids, limits)
+            assert np.all(ids == 0)
+            assert np.all(limits == 1)
+            lib.mark_serial(ids, limits)
+            assert np.all(ids == 0)
+            assert np.all(limits == -1)
+
+            chunk = int(np.iinfo(np.uintp).max)
+            assert lib.set_controls(1, chunk) == 7
+            assert lib.set_controls(2, 0) == chunk
+            try:
+                lib.set_controls(3, 0)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('thread limit was not checked')
+
+            try:
+                lib.sum_array(a, -a.size - 1)
+            except IndexError:
+                pass
+            else:
+                raise AssertionError('worker IndexError was lost')
+            a[-1] = -7
+            try:
+                lib.check_values(a)
+            except ValueError as exc:
+                assert exc.args == ("negative value", -7)
+            else:
+                raise AssertionError('dynamic worker exception was lost')
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                totals = pool.map(lib.sum_array, [a, a], [0, 0])
+                assert list(totals) == [a.sum(), a.sum()]
+
+            if sys.platform.startswith('linux'):
+                pid = os.fork()
+                if pid == 0:
+                    try:
+                        if backend == 'tbb':
+                            assert lib.sum_array(a, 0) == a.sum()
+                        else:
+                            try:
+                                lib.sum_array(a, 0)
+                            except RuntimeError as exc:
+                                assert 'OpenMP' in str(exc) and 'spawn' in str(exc)
+                            else:
+                                raise AssertionError('OpenMP ran in a forked child')
+                    except BaseException:
+                        import traceback
+                        traceback.print_exc()
+                        os._exit(1)
+                    os._exit(0)
+                assert os.waitpid(pid, 0)[1] == 0
+                assert lib.sum_array(a, 0) == a.sum()
+            """)
+        env = dict(os.environ, NUMBA_BOUNDSCHECK='1', NUMBA_NUM_THREADS='2',
+                   NUMBA_THREADING_LAYER='workqueue', OMP_DYNAMIC='FALSE',
+                   OMP_THREAD_LIMIT='4', OMP_MAX_ACTIVE_LEVELS='1')
+        repo_root = os.path.dirname(os.path.dirname(base_path))
+        env['PYTHONPATH'] = os.pathsep.join(
+            p for p in (repo_root, env.get('PYTHONPATH')) if p)
+        for mode in ('direct', 'setuptools'):
+            with self.subTest(mode=mode):
+                output_dir = os.path.join(self.tmpdir, mode)
+                os.mkdir(output_dir)
+                subprocess.check_call(
+                    [sys.executable, script_path, mode, output_dir, backend],
+                    env=env, cwd=self.tmpdir)
+                subprocess.check_call(
+                    [sys.executable, '-c', runtime_script, backend],
+                    env=env, cwd=output_dir, timeout=60)
+
     def test_compile_for_cpu(self):
         # Compiling for the host CPU should always succeed
         self.check_compile_for_cpu(ll.get_host_cpu_name())

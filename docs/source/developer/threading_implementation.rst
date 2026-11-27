@@ -191,40 +191,15 @@ Some caveats to be aware of when testing thread masking:
 Use in Code Generation
 ~~~~~~~~~~~~~~~~~~~~~~
 
-The general pattern for using ``get_num_threads`` in code generation is
+Parfor lowering calls the shared native threading interface in
+``numba/np/ufunc/parallel_runtime.h``. JIT compilation registers the selected
+backend's native entry points. Ahead-of-time compilation links them into the
+generated extension. Both use ``numba_parallel_get_num_threads`` to read the
+calling thread's mask and pass it through scheduling and dispatch.
 
-.. code:: python
-
-   from llvmlite import ir as llvmir
-
-   get_num_threads = cgutils.get_or_insert_function(builder.module
-       llvmir.FunctionType(llvmir.IntType(types.intp.bitwidth), []),
-       name="get_num_threads")
-
-   num_threads = builder.call(get_num_threads, [])
-
-   with cgutils.if_unlikely(builder, builder.icmp_signed('<=', num_threads,
-                                                 num_threads.type(0))):
-       cgutils.printf(builder, "num_threads: %d\n", num_threads)
-       context.call_conv.return_user_exc(builder, RuntimeError,
-                                                 ("Invalid number of threads. "
-                                                  "This likely indicates a bug in Numba.",))
-
-   # Pass num_threads through to the appropriate backend function here
-
-See the code in ``numba/parfors/parfor_lowering.py``.
-
-The guard against ``num_threads`` being <= 0 is not strictly necessary, but it
-can protect against accidentally incorrect behavior in case the thread masking
-logic contains a bug.
-
-The ``num_threads`` variable should be passed through to the appropriate
-backend function, such as ``do_scheduling`` or ``parallel_for``. If it's used
-in some way other than passing it through to the backend function, the above
-considerations should be taken into account to ensure the use of the
-``num_threads`` variable is safe. It would probably be better to keep such
-logic in the threading backends, rather than trying to do it in code
-generation.
+The common dispatcher releases the GIL around native work and transfers the
+first reported worker error back to the caller. See
+``numba/parfors/parfor_lowering.py`` for the scheduling and dispatch calls.
 
 .. _chunk-details-label:
 

@@ -11,10 +11,11 @@ from numba.pycc import llvm_types as lt
 from numba.core.cgutils import create_constant_array
 from numba.core.compiler import compile_extra, Flags
 from numba.core.compiler_lock import global_compiler_lock
+from numba.core.cpu_options import ParallelOptions
 
 from numba.core.registry import cpu_target
 from numba.core.runtime import nrtdynmod
-from numba.core import cgutils
+from numba.core import cgutils, errors
 from numba.core.environment import lookup_environment
 
 
@@ -69,10 +70,11 @@ class ExportEntry(object):
     A simple record for exporting symbols.
     """
 
-    def __init__(self, symbol, signature, function):
+    def __init__(self, symbol, signature, function, parallel=False):
         self.symbol = symbol
         self.signature = signature
         self.function = function
+        self.parallel = parallel
 
     def __repr__(self):
         return "ExportEntry(%r, %r)" % (self.symbol, self.signature)
@@ -158,10 +160,12 @@ class _ModuleCompiler(object):
             library.add_ir_module(nrt_module)
 
         for entry in self.export_entries:
+            export_flags = flags.copy()
+            export_flags.auto_parallel = ParallelOptions(entry.parallel)
             cres = compile_extra(self.typing_context, self.context,
                                 entry.function,
                                 entry.signature.args,
-                                entry.signature.return_type, flags,
+                                entry.signature.return_type, export_flags,
                                 locals={}, library=library)
 
             # Fix up dynamic exc globals
@@ -207,6 +211,12 @@ class _ModuleCompiler(object):
 
         # Hide all functions in the DLL except those explicitly exported
         library.finalize()
+        if not any(entry.parallel for entry in self.export_entries):
+            if any(fn.is_declaration and fn.name.startswith("numba_parallel_")
+                   for fn in library._final_module.functions):
+                raise errors.UnsupportedError(
+                    "A standalone module containing parallel calls requires "
+                    "an export with parallel=True")
         for fn in library.get_defined_functions():
             if fn.name not in self.dll_exports:
                 if fn.linkage in {Linkage.private, Linkage.internal}:

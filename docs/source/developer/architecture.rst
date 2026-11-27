@@ -727,14 +727,11 @@ sentinel and the sentinel is replaced with the loop body of the parfor.
 Then, the process of creating the parallel GUFunc is completed by
 compiling this merged IR with the Numba compiler's ``compile_ir`` function.
 
-To call the parallel GUFunc, the static schedule must be created.
-Code is inserted to call a function named ``do_scheduling.``  This function
-is called with the size of each of the parfor's dimensions and the number
-`N` of configured Numba threads (:envvar:`NUMBA_NUM_THREADS`).
-The ``do_scheduling`` function will divide
-the iteration space into N approximately equal sized regions (linear for
-1D, rectangular for 2D, or hyperrectangles for 3+D) and the resulting
-schedule is passed to the parallel GUFunc.  The number of threads
+The compiler emits a call to ``numba_parallel_schedule_signed`` or
+``numba_parallel_schedule_unsigned`` before dispatching the parallel GUFunc.
+The scheduler divides the iteration space into approximately equal-sized
+regions (linear for 1D, rectangular for 2D, or hyperrectangles for 3+D).
+By default it creates one region per configured thread. The number of regions
 dedicated to a given dimension of the full iteration space is roughly
 proportional to the ratio of the size of the given dimension to the sum
 of the sizes of all the dimensions of the iteration space.

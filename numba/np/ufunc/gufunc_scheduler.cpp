@@ -10,7 +10,7 @@
 #include <iostream>
 #include <stdio.h>
 #include <stdint.h>
-#include "gufunc_scheduler.h"
+#include "parallel_runtime.h"
 
 #ifdef _MSC_VER
 #define THREAD_LOCAL(ty) __declspec(thread) ty
@@ -448,4 +448,59 @@ extern "C" void do_scheduling_unsigned(uintp num_dim, intp *starts, intp *ends, 
         print_schedule(ret);
     }
     flatten_schedule(ret, sched);
+}
+
+uintp numba_parallel_get_chunksize(void)
+{
+    return get_parallel_chunksize();
+}
+
+uintp numba_parallel_set_chunksize(uintp count)
+{
+    return set_parallel_chunksize(count);
+}
+
+static intp *parallel_schedule(uintp ndim, intp *starts, intp *ends,
+                               uintp count, bool is_signed, intp debug,
+                               uintp *divisions)
+{
+    intp *schedule = nullptr;
+    try {
+        const uintp size = get_sched_size(count, ndim, starts, ends);
+        if (size > SIZE_MAX / sizeof(intp) / 2 / ndim) {
+            return nullptr;
+        }
+        schedule = allocate_sched(size * ndim * 2);
+        if (schedule == nullptr) {
+            return nullptr;
+        }
+        if (is_signed) {
+            do_scheduling_signed(ndim, starts, ends, size, schedule, debug);
+        } else {
+            do_scheduling_unsigned(ndim, starts, ends, size,
+                                   reinterpret_cast<uintp *>(schedule), debug);
+        }
+        *divisions = size;
+    } catch (...) {
+        deallocate_sched(schedule);
+        return nullptr;
+    }
+    return schedule;
+}
+
+intp *numba_parallel_schedule_signed(uintp ndim, intp *starts, intp *ends,
+                                     uintp count, intp debug, uintp *divisions)
+{
+    return parallel_schedule(ndim, starts, ends, count, true, debug, divisions);
+}
+
+intp *numba_parallel_schedule_unsigned(uintp ndim, intp *starts, intp *ends,
+                                       uintp count, intp debug, uintp *divisions)
+{
+    return parallel_schedule(ndim, starts, ends, count, false, debug, divisions);
+}
+
+void numba_parallel_free_schedule(intp *schedule)
+{
+    deallocate_sched(schedule);
 }

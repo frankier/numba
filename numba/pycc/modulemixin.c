@@ -23,6 +23,10 @@
 #include "../core/runtime/nrt.h"
 #endif
 
+#ifdef PYCC_PARALLEL
+VISIBILITY_HIDDEN int numba_parallel_init_from_env(void);
+#endif
+
 #if (PY_MAJOR_VERSION == 3) && (PY_MINOR_VERSION >= 12)
     #define Py_BUILD_CORE 1
     #include "internal/pycore_pyhash.h"
@@ -139,6 +143,11 @@ PYCC(pycc_init_) (PyObject *module, PyMethodDef *defs,
     if (!init_numpy()) {
         goto error;
     }
+#ifdef PYCC_PARALLEL
+    if (numba_parallel_init_from_env()) {
+        goto error;
+    }
+#endif
     if (init_dynfunc_module(module)) {
         goto error;
     }

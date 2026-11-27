@@ -6,6 +6,8 @@
 #ifndef GUFUNC_SCHEDULER
 #define GUFUNC_SCHEDULER
 
+#include "../../_numba_common.h"
+
 /* define int64_t and uint64_t for Visual Studio, where stdint only available > VS2008 */
 #ifdef _MSC_VER
     #define int64_t signed __int64
@@ -38,13 +40,13 @@ extern "C"
 {
 #endif
 
-void do_scheduling_signed(uintp num_dim, intp *starts, intp *ends, uintp num_threads, intp *sched, intp debug);
-void do_scheduling_unsigned(uintp num_dim, intp *starts, intp *ends, uintp num_threads, uintp *sched, intp debug);
-uintp set_parallel_chunksize(uintp);
-uintp get_parallel_chunksize(void);
-uintp get_sched_size(uintp num_threads, uintp num_dim, intp *starts, intp *ends);
-intp * allocate_sched(uintp sched_size);
-void deallocate_sched(intp * sched);
+VISIBILITY_HIDDEN void do_scheduling_signed(uintp num_dim, intp *starts, intp *ends, uintp num_threads, intp *sched, intp debug);
+VISIBILITY_HIDDEN void do_scheduling_unsigned(uintp num_dim, intp *starts, intp *ends, uintp num_threads, uintp *sched, intp debug);
+VISIBILITY_HIDDEN uintp set_parallel_chunksize(uintp);
+VISIBILITY_HIDDEN uintp get_parallel_chunksize(void);
+VISIBILITY_HIDDEN uintp get_sched_size(uintp num_threads, uintp num_dim, intp *starts, intp *ends);
+VISIBILITY_HIDDEN intp * allocate_sched(uintp sched_size);
+VISIBILITY_HIDDEN void deallocate_sched(intp * sched);
 
 #ifdef __cplusplus
 }

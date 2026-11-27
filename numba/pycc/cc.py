@@ -2,6 +2,7 @@ from setuptools import distutils as dutils
 from setuptools.command import build_ext
 from setuptools.extension import Extension
 
+from copy import copy
 import os
 import sys
 import tempfile
@@ -79,7 +80,6 @@ class CC(object):
         self._output_file = self._toolchain.get_ext_filename(extension_name)
         self._use_nrt = True
         self._target_cpu = ''
-        self._parallel = False
 
     @property
     def name(self):
@@ -130,17 +130,6 @@ class CC(object):
         self._target_cpu = value
 
     @property
-    def parallel(self):
-        """Enable parallel compilation and link the extension with oneTBB."""
-        return self._parallel
-
-    @parallel.setter
-    def parallel(self, value):
-        if not isinstance(value, bool):
-            raise TypeError("parallel must be a bool")
-        self._parallel = value
-
-    @property
     def verbose(self):
         """
         Whether to display detailed information when compiling.
@@ -151,17 +140,21 @@ class CC(object):
     def verbose(self, value):
         self._verbose = value
 
-    def export(self, exported_name, sig):
+    def export(self, exported_name, sig, *, parallel=False):
         """
         Mark a function for exporting in the extension module.
+
+        Set parallel to enable automatic parallelization for this export.
         """
+        if not isinstance(parallel, bool):
+            raise TypeError("parallel must be a bool")
         fn_args, fn_retty = sigutils.normalize_signature(sig)
         sig = typing.signature(fn_retty, *fn_args)
         if exported_name in self._exported_functions:
             raise KeyError("duplicated export symbol %s" % (exported_name))
 
         def decorator(func):
-            entry = ExportEntry(exported_name, sig, func)
+            entry = ExportEntry(exported_name, sig, func, parallel)
             self._exported_functions[exported_name] = entry
             return func
 
@@ -172,14 +165,18 @@ class CC(object):
         return sorted(self._exported_functions.values(),
                       key=lambda entry: entry.symbol)
 
+    def _needs_parallel_runtime(self):
+        return any(entry.parallel for entry in self._export_entries)
+
     def _get_mixin_sources(self):
         here = os.path.dirname(__file__)
         mixin_sources = self._mixin_sources[:]
         if self._use_nrt:
             mixin_sources.append('../core/runtime/nrt.cpp')
-        if self.parallel:
+        if self._needs_parallel_runtime():
             mixin_sources.extend(('../np/ufunc/tbbpool.cpp',
-                                  '../np/ufunc/gufunc_scheduler.cpp'))
+                                  '../np/ufunc/gufunc_scheduler.cpp',
+                                  '../np/ufunc/parallel_runtime.cpp'))
         return [os.path.join(here, f) for f in mixin_sources]
 
     def _get_mixin_defines(self):
@@ -198,20 +195,20 @@ class CC(object):
             ('NUMBA_LAPACK_BUILD_ILP64',
              int(getattr(_helperlib, "LAPACK_BUILD_ILP64", 0))),
             ]
-        if self.parallel:
-            defines.append(('PYCC_TBB', 1))
+        if self._needs_parallel_runtime():
+            defines.append(('PYCC_PARALLEL', 1))
         return defines
 
     def _get_extra_cflags(self):
         extra_cflags = self._extra_cflags.get(sys.platform, [])
         if not extra_cflags:
             extra_cflags = self._extra_cflags.get(os.name, [])
-        if self.parallel and os.name == 'posix':
+        if self._needs_parallel_runtime() and os.name == 'posix':
             extra_cflags = extra_cflags + ['-fvisibility=hidden']
         return extra_cflags
 
     def _get_tbb_options(self):
-        if not self.parallel:
+        if not self._needs_parallel_runtime():
             return [], [], []
 
         default_root = (os.path.join(sys.prefix, 'Library')
@@ -253,8 +250,7 @@ class CC(object):
     @global_compiler_lock
     def _compile_object_files(self, build_dir):
         compiler = ModuleCompiler(self._export_entries, self._basename,
-                                self._use_nrt, cpu_name=self._target_cpu,
-                                parallel=self.parallel)
+                                self._use_nrt, cpu_name=self._target_cpu)
         compiler.external_init_function = self._init_function
         temp_obj = os.path.join(build_dir,
                                 os.path.splitext(self._output_file)[0] + '.o')
@@ -282,7 +278,7 @@ class CC(object):
             self._toolchain.link_shared(
                 output_dll, objects, libraries, library_dirs,
                 export_symbols=dll_exports, extra_ldflags=extra_ldflags,
-                target_lang='c++' if self.parallel else None)
+                target_lang='c++' if self._needs_parallel_runtime() else None)
 
     def distutils_extension(self, **kwargs):
         """
@@ -316,7 +312,8 @@ class CC(object):
                            extra_link_args=extra_link_args,
                            **kwargs)
         ext.monkey_patch_distutils()
-        ext._cc = self
+        ext._cc = copy(self)
+        ext._cc._exported_functions = self._exported_functions.copy()
         return ext
 
 
@@ -331,7 +328,7 @@ class _CCExtension(Extension):
 
     def _prepare_object_files(self, build_ext):
         cc = self._cc
-        dir_util.mkpath(os.path.join(build_ext.build_temp, *self.name.split('.')[:-1]))
+        dir_util.mkpath(build_ext.build_temp)
         objects, _ = cc._compile_object_files(build_ext.build_temp)
         # Add generated object files for linking
         self.extra_objects = objects
@@ -351,9 +348,12 @@ class _CCExtension(Extension):
 
             def build_extension(self, ext):
                 if isinstance(ext, _CCExtension):
-                    ext._prepare_object_files(self)
-
-                _orig_build_ext.build_extension(self, ext)
+                    command = copy(self)
+                    command.build_temp = os.path.join(
+                        self.build_temp, *ext.name.split('.'))
+                    ext._prepare_object_files(command)
+                    return _orig_build_ext.build_extension(command, ext)
+                return _orig_build_ext.build_extension(self, ext)
 
         build_ext.build_ext = _CC_build_ext
 

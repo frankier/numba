@@ -98,16 +98,15 @@ operate on double-precision floats (``f8``)::
 Parallel compilation with oneTBB
 --------------------------------
 
-Set ``cc.parallel = True`` before building to enable the parallel compiler
-passes for the module's exports. For example::
+Pass ``parallel=True`` to ``cc.export()`` to enable the parallel compiler
+passes for that export. For example::
 
    from numba import prange
    from numba.pycc import CC
 
    cc = CC('parallel_example')
-   cc.parallel = True
 
-   @cc.export('sum_array', 'f8(f8[::1])')
+   @cc.export('sum_array', 'f8(f8[::1])', parallel=True)
    def sum_array(a):
        total = 0.0
        for i in prange(a.size):
@@ -124,9 +123,21 @@ runtime loader's search path. These requirements apply to both
 ``cc.compile()`` and ``cc.distutils_extension()``.
 
 Set ``NUMBA_NUM_THREADS`` before importing the compiled extension to limit the
-size of its oneTBB task arena. The default comes from oneTBB. Numba's JIT
-threading-layer selection and thread and chunk-size setters apply to JIT
-functions. Use the multiprocessing ``spawn`` start method with these extensions.
+size of its oneTBB task arena. The default comes from oneTBB. Exports and
+native helpers can use Numba's thread and chunk-size APIs. To change those
+settings from Python without importing Numba at runtime, export a function
+that calls the setters. Thread masks and chunk sizes are local to the calling
+thread and extension. A positive chunk size lets oneTBB distribute smaller
+chunks for uneven workloads.
+
+The extension's runtime also handles calls to parallel helpers compiled by
+Numba during the build. Mark at least one export with ``parallel=True`` when
+the extension calls those helpers or uses the threading APIs.
+
+The oneTBB JIT backend and oneTBB extensions share the fork lifecycle within
+a Python interpreter. Forking from the thread that initialized oneTBB works
+when its worker threads can be stopped before the fork. Use ``spawn`` for
+portable multiprocessing and for programs that use other oneTBB clients.
 
 
 Distutils integration

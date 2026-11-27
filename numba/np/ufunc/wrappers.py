@@ -467,10 +467,10 @@ class _GufuncWrapper(object):
         with builder.if_then(status.is_error, likely=False):
             gil = pyapi.gil_ensure()
             self.context.call_conv.raise_error(builder, pyapi, status)
-            if self.is_parfors and self.context.aot_mode:
+            if self.is_parfors:
                 fnty = ir.FunctionType(ir.VoidType(), [data.type])
                 save_error = cgutils.get_or_insert_function(
-                    builder.module, fnty, "pycc_tbb_save_error")
+                    builder.module, fnty, "numba_parallel_save_error")
                 builder.call(save_error, [data])
             pyapi.gil_release(gil)
 

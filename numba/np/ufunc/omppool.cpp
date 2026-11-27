@@ -13,7 +13,7 @@ Threading layer on top of OpenMP.
 #include <string.h>
 #include <stdio.h>
 #include "workqueue.h"
-#include "gufunc_scheduler.h"
+#include "parallel_runtime.h"
 
 #ifdef _WIN32
 #include <malloc.h>
@@ -332,6 +332,14 @@ static void ready(void)
 {
 }
 
+int numba_parallel_init(int count)
+{
+    launch_threads(count);
+    return 0;
+}
+
+NUMBA_DEFINE_PARALLEL_BACKEND(_INIT_NUM_THREADS, NULL)
+
 MOD_INIT(omppool)
 {
     PyObject *m;
@@ -339,6 +347,7 @@ MOD_INIT(omppool)
     if (m == NULL)
         return MOD_ERROR_VAL;
 
+    NUMBA_PARALLEL_SYMBOLS(m);
     SetAttrStringFromVoidPointer(m, launch_threads);
     SetAttrStringFromVoidPointer(m, synchronize);
     SetAttrStringFromVoidPointer(m, ready);

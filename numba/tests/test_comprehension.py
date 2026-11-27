@@ -258,7 +258,7 @@ class TestArrayComprehension(unittest.TestCase):
         else:
             self.assertNotIn('allocate list', cfunc.inspect_llvm(cfunc.signatures[0]))
         if run_parallel:
-            self.assertIn('@do_scheduling', cfunc.inspect_llvm(cfunc.signatures[0]))
+            self.assertIn('@numba_parallel_schedule', cfunc.inspect_llvm(cfunc.signatures[0]))
 
     def test_comp_with_array_1(self):
         def comp_with_array_1(n):

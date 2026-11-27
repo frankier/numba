@@ -62,15 +62,13 @@ def dumps(obj):
 
 
 def runtime_build_excinfo_struct(static_exc, exc_args):
-    exc, static_args, locinfo = cloudpickle.loads(static_exc)
-    real_args = []
-    exc_args_iter = iter(exc_args)
-    for arg in static_args:
-        if isinstance(arg, ir.Value):
-            real_args.append(next(exc_args_iter))
-        else:
-            real_args.append(arg)
-    return (exc, tuple(real_args), locinfo)
+    exc, static_args, locinfo, *dynamic = cloudpickle.loads(static_exc)
+    # Older cached functions encode dynamic entries as LLVM placeholders.
+    slots = dynamic[0] if dynamic else (isinstance(a, ir.Value) for a in static_args)
+    values = iter(exc_args)
+    args = tuple(next(values) if slot else arg
+                 for slot, arg in zip(slots, static_args))
+    return (exc, args, locinfo)
 
 
 # Alias to pickle.loads to allow `serialize.loads()`

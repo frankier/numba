@@ -14,7 +14,7 @@ import os
 import sys
 import warnings
 from threading import RLock as threadRLock
-from ctypes import CFUNCTYPE, c_int, CDLL, POINTER, c_uint
+from ctypes import CFUNCTYPE, PYFUNCTYPE, c_int, c_size_t, CDLL
 
 import numpy as np
 
@@ -46,7 +46,7 @@ def get_thread_count():
 NUM_THREADS = get_thread_count()
 
 
-def build_gufunc_kernel(library, ctx, info, sig, inner_ndim):
+def build_gufunc_kernel(library, ctx, info, sig, inner_ndim, is_parfors=False):
     """Wrap the original CPU ufunc/gufunc with a parallel dispatcher.
     This function will wrap gufuncs and ufuncs something like.
 
@@ -103,15 +103,12 @@ def build_gufunc_kernel(library, ctx, info, sig, inner_ndim):
     intp_t = ctx.get_value_type(types.intp)
     intp_ptr_t = ir.PointerType(intp_t)
 
-    return_ty = ir.IntType(32) if ctx.aot_mode else ir.VoidType()
+    return_ty = ir.IntType(32) if is_parfors else ir.VoidType()
     fnty = ir.FunctionType(return_ty, [byte_ptr_ptr_t, intp_ptr_t,
                                        intp_ptr_t, byte_ptr_t])
     wrapperlib = ctx.codegen().create_library('parallelgufuncwrapper')
     mod = wrapperlib.create_ir_module('parallel.gufunc.wrapper')
-    if ctx.aot_mode:
-        kernel_name = ".kernel." + info.name
-    else:
-        kernel_name = ".kernel.{}_{}".format(id(info.env), info.name)
+    kernel_name = ".kernel." + info.name
     lfunc = ir.Function(mod, fnty, name=kernel_name)
 
     bb_entry = lfunc.append_basic_block('')
@@ -124,7 +121,7 @@ def build_gufunc_kernel(library, ctx, info, sig, inner_ndim):
     # Release the GIL (and ensure we have the GIL)
     # Note: numpy ufunc may not always release the GIL; thus,
     #       we need to ensure we have the GIL.
-    if not ctx.aot_mode:
+    if not is_parfors:
         pyapi = ctx.get_python_api(builder)
         gil_state = pyapi.gil_ensure()
         thread_state = pyapi.save_thread()
@@ -140,13 +137,6 @@ def build_gufunc_kernel(library, ctx, info, sig, inner_ndim):
     if not isinstance(sig.return_type, types.NoneType):
         array_count += 1
 
-    parallel_for_ty = ir.FunctionType(return_ty,
-                                      [byte_ptr_t] * 5 + [intp_t, ] * 3)
-    dispatch_name = ('pycc_tbb_parallel_for' if ctx.aot_mode else
-                     'numba_parallel_for')
-    parallel_for = cgutils.get_or_insert_function(mod, parallel_for_ty,
-                                                  dispatch_name)
-
     # Reference inner-function and link
     innerfunc_fnty = ir.FunctionType(
         ir.VoidType(),
@@ -157,18 +147,23 @@ def build_gufunc_kernel(library, ctx, info, sig, inner_ndim):
     wrapperlib.add_linking_library(info.library)
 
     num_threads = _emit_get_num_threads(ctx, builder)
-
-    # Prepare call
     fnptr = builder.bitcast(tmp_voidptr, byte_ptr_t)
-    innerargs = [as_void_ptr(x) for x
-                 in [args, dimensions, steps, data]]
-    result = builder.call(
-        parallel_for, [fnptr] + innerargs +
-        [intp_t(x) for x in (inner_ndim, array_count)] + [num_threads])
-
-    if ctx.aot_mode:
+    counts = [intp_t(inner_ndim), intp_t(array_count)]
+    if is_parfors:
+        arg_types = [byte_ptr_t, byte_ptr_ptr_t, intp_ptr_t, intp_ptr_t,
+                     intp_t, intp_t, num_threads.type]
+        dispatch = cgutils.get_or_insert_function(
+            mod, ir.FunctionType(return_ty, arg_types),
+            'numba_parallel_dispatch')
+        result = builder.call(dispatch, [fnptr, args, dimensions, steps] +
+                              counts + [num_threads])
         builder.ret(result)
     else:
+        arg_types = [byte_ptr_t] * 5 + [intp_t, intp_t, num_threads.type]
+        dispatch = cgutils.get_or_insert_function(
+            mod, ir.FunctionType(return_ty, arg_types), 'numba_parallel_for')
+        innerargs = [as_void_ptr(x) for x in (args, dimensions, steps, data)]
+        builder.call(dispatch, [fnptr] + innerargs + counts + [num_threads])
         pyapi.restore_thread(thread_state)
         pyapi.gil_release(gil_state)
         builder.ret_void()
@@ -273,7 +268,7 @@ def build_gufunc_wrapper(py_func, cres, sin, sout, cache, is_parfors):
     inner_ndim = len(sym_in | sym_out)
 
     info = build_gufunc_kernel(
-        library, ctx, innerinfo, signature, inner_ndim,
+        library, ctx, innerinfo, signature, inner_ndim, is_parfors,
     )
     return info
 
@@ -522,8 +517,16 @@ def _launch_threads():
             ll.add_symbol('allocate_sched', lib.allocate_sched)
             ll.add_symbol('deallocate_sched', lib.deallocate_sched)
 
-            launch_threads = CFUNCTYPE(None, c_int)(lib.launch_threads)
-            launch_threads(NUM_THREADS)
+            init = PYFUNCTYPE(c_int, c_int)(lib.numba_parallel_init)
+            init(NUM_THREADS)
+            for name in (
+                'get_num_threads', 'get_max_threads', 'get_thread_id',
+                'set_num_threads', 'get_chunksize', 'set_chunksize',
+                'schedule_signed', 'schedule_unsigned', 'free_schedule',
+                'dispatch', 'save_error',
+            ):
+                symbol = 'numba_parallel_' + name
+                ll.add_symbol(symbol, getattr(lib, symbol))
 
             _load_threading_functions(lib)  # load late
 
@@ -552,20 +555,12 @@ def _load_threading_functions(lib):
     ll.add_symbol('set_parallel_chunksize', lib.set_parallel_chunksize)
     ll.add_symbol('get_parallel_chunksize', lib.get_parallel_chunksize)
     ll.add_symbol('get_sched_size', lib.get_sched_size)
-    global _set_parallel_chunksize
-    _set_parallel_chunksize = CFUNCTYPE(c_uint,
-                                        c_uint)(lib.set_parallel_chunksize)
-    global _get_parallel_chunksize
-    _get_parallel_chunksize = CFUNCTYPE(c_uint)(lib.get_parallel_chunksize)
-    global _get_sched_size
-    _get_sched_size = CFUNCTYPE(c_uint,
-                                c_uint,
-                                c_uint,
-                                POINTER(c_int),
-                                POINTER(c_int))(lib.get_sched_size)
+    global _set_parallel_chunksize, _get_parallel_chunksize
+    _set_parallel_chunksize = CFUNCTYPE(c_size_t, c_size_t)(
+        lib.numba_parallel_set_chunksize)
+    _get_parallel_chunksize = CFUNCTYPE(c_size_t)(
+        lib.numba_parallel_get_chunksize)
 
-
-# Some helpers to make set_num_threads jittable
 
 def gen_snt_check():
     from numba.core.config import NUMBA_NUM_THREADS
@@ -578,11 +573,6 @@ def gen_snt_check():
 
 
 snt_check = gen_snt_check()
-
-
-@overload(snt_check)
-def ol_snt_check(n):
-    return snt_check
 
 
 def set_num_threads(n):
@@ -615,16 +605,14 @@ def set_num_threads(n):
     _set_num_threads(n)
 
 
-@overload(set_num_threads)
+@overload(set_num_threads, inline='always')
 def ol_set_num_threads(n):
-    _launch_threads()
     if not isinstance(n, types.Integer):
         msg = "The number of threads specified must be an integer"
         raise errors.TypingError(msg)
 
     def impl(n):
-        snt_check(n)
-        _set_num_threads(n)
+        _iset_num_threads(n)
     return impl
 
 
@@ -660,35 +648,54 @@ def get_num_threads():
     return num_threads
 
 
-@overload(get_num_threads)
+@overload(get_num_threads, inline='always')
 def ol_get_num_threads():
-    _launch_threads()
-
     def impl():
-        num_threads = _get_num_threads()
-        if num_threads <= 0:
-            print("Broken thread_id: ", get_thread_id())
-            print("num_threads: ", num_threads)
-            raise RuntimeError("Invalid number of threads. "
-                               "This likely indicates a bug in Numba.")
-        return num_threads
+        return np.int32(_iget_num_threads())
     return impl
 
 
+def _emit_runtime_call(context, builder, name, ret, args=()):
+    if not context.aot_mode:
+        _launch_threads()
+    fnty = ir.FunctionType(ret, [arg.type for arg in args])
+    fn = cgutils.get_or_insert_function(
+        builder.module, fnty, 'numba_parallel_' + name)
+    return builder.call(fn, args)
+
+
 def _emit_get_num_threads(context, builder):
-    name = "pycc_tbb_get_num_threads" if context.aot_mode else "get_num_threads"
-    fnty = ir.FunctionType(cgutils.intp_t, [])
-    fn = cgutils.get_or_insert_function(builder.module, fnty, name)
-    return builder.call(fn, [])
+    return _emit_runtime_call(context, builder, 'get_num_threads', ir.IntType(32))
 
 
 @intrinsic
 def _iget_num_threads(typingctx):
     def codegen(context, builder, signature, args):
-        if not context.aot_mode:
-            _launch_threads()
-        return _emit_get_num_threads(context, builder)
+        count = _emit_get_num_threads(context, builder)
+        return context.cast(builder, count, types.int32, types.intp)
     return signature(types.intp), codegen
+
+
+@intrinsic
+def _iset_num_threads(typingctx, n):
+    def codegen(context, builder, signature, args):
+        maximum = _emit_runtime_call(context, builder, 'get_max_threads',
+                                     ir.IntType(32))
+        comparable = context.cast(builder, args[0], n,
+                                  types.int64 if n.signed else types.uint64)
+        limit = builder.zext(maximum, comparable.type)
+        too_small = builder.icmp_unsigned('==', comparable, comparable.type(0))
+        too_large = builder.icmp_unsigned('>', comparable, limit)
+        with cgutils.if_unlikely(builder, builder.or_(too_small, too_large)):
+            context.call_conv.return_user_exc(
+                builder, ValueError,
+                ("The number of threads must be between 1 and the configured "
+                 "NUMBA_NUM_THREADS limit",))
+        count = context.cast(builder, args[0], n, types.int32)
+        _emit_runtime_call(context, builder, 'set_num_threads',
+                           ir.VoidType(), [count])
+        return context.get_dummy_value()
+    return signature(types.none, n), codegen
 
 
 def get_thread_id():
@@ -704,10 +711,8 @@ def get_thread_id():
     return _get_thread_id()
 
 
-@overload(get_thread_id)
+@overload(get_thread_id, inline='always')
 def ol_get_thread_id():
-    _launch_threads()
-
     def impl():
         return _iget_thread_id()
     return impl
@@ -716,11 +721,9 @@ def ol_get_thread_id():
 @intrinsic
 def _iget_thread_id(typingctx):
     def codegen(context, builder, signature, args):
-        mod = builder.module
-        fnty = ir.FunctionType(cgutils.intp_t, [])
-        name = "pycc_tbb_get_thread_id" if context.aot_mode else "get_thread_id"
-        fn = cgutils.get_or_insert_function(mod, fnty, name)
-        return builder.call(fn, [])
+        result = _emit_runtime_call(context, builder, 'get_thread_id',
+                                    ir.IntType(32))
+        return context.cast(builder, result, types.int32, types.intp)
     return signature(types.intp), codegen
 
 
@@ -737,6 +740,8 @@ def set_parallel_chunksize(n):
         raise TypeError("The parallel chunksize must be an integer")
     if n < 0:
         raise ValueError("chunksize must be greater than or equal to zero")
+    if n > np.iinfo(np.uintp).max:
+        raise OverflowError("chunksize does not fit in uintp")
     return _set_parallel_chunksize(n)
 
 
@@ -745,24 +750,49 @@ def get_parallel_chunksize():
     return _get_parallel_chunksize()
 
 
-@overload(set_parallel_chunksize)
+@overload(set_parallel_chunksize, inline='always')
 def ol_set_parallel_chunksize(n):
-    _launch_threads()
     if not isinstance(n, types.Integer):
         msg = "The parallel chunksize must be an integer"
         raise errors.TypingError(msg)
 
     def impl(n):
-        if n < 0:
-            raise ValueError("chunksize must be greater than or equal to zero")
-        return _set_parallel_chunksize(n)
+        return _iset_parallel_chunksize(n)
     return impl
 
 
-@overload(get_parallel_chunksize)
+@overload(get_parallel_chunksize, inline='always')
 def ol_get_parallel_chunksize():
-    _launch_threads()
-
     def impl():
-        return _get_parallel_chunksize()
+        return _iget_parallel_chunksize()
     return impl
+
+
+@intrinsic
+def _iget_parallel_chunksize(typingctx):
+    def codegen(context, builder, signature, args):
+        return _emit_runtime_call(context, builder, 'get_chunksize',
+                                  cgutils.intp_t)
+    return signature(types.uintp), codegen
+
+
+@intrinsic
+def _iset_parallel_chunksize(typingctx, n):
+    def codegen(context, builder, signature, args):
+        value = args[0]
+        if n.signed:
+            negative = builder.icmp_signed('<', value, value.type(0))
+            with cgutils.if_unlikely(builder, negative):
+                context.call_conv.return_user_exc(
+                    builder, ValueError,
+                    ("chunksize must be greater than or equal to zero",))
+        if n.bitwidth > types.uintp.bitwidth:
+            overflow = builder.icmp_unsigned(
+                '>', value, value.type((1 << types.uintp.bitwidth) - 1))
+            with cgutils.if_unlikely(builder, overflow):
+                context.call_conv.return_user_exc(
+                    builder, OverflowError, ("chunksize does not fit in uintp",))
+        count = context.cast(builder, value, n, types.uintp)
+        return _emit_runtime_call(context, builder, 'set_chunksize',
+                                  cgutils.intp_t, [count])
+    return signature(types.uintp, n), codegen

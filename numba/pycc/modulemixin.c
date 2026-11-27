@@ -23,8 +23,8 @@
 #include "../core/runtime/nrt.h"
 #endif
 
-#ifdef PYCC_TBB
-VISIBILITY_HIDDEN int pycc_tbb_init(void);
+#ifdef PYCC_PARALLEL
+VISIBILITY_HIDDEN int numba_parallel_init_from_env(void);
 #endif
 
 #if (PY_MAJOR_VERSION == 3) && (PY_MINOR_VERSION >= 12)
@@ -143,8 +143,8 @@ PYCC(pycc_init_) (PyObject *module, PyMethodDef *defs,
     if (!init_numpy()) {
         goto error;
     }
-#ifdef PYCC_TBB
-    if (pycc_tbb_init()) {
+#ifdef PYCC_PARALLEL
+    if (numba_parallel_init_from_env()) {
         goto error;
     }
 #endif

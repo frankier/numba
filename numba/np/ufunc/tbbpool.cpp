@@ -19,12 +19,7 @@ Implement parallel vectorize workqueue on top of Intel TBB.
 #include <thread>
 #include "workqueue.h"
 
-#include "gufunc_scheduler.h"
-
-#ifdef PYCC_TBB
-#include <cerrno>
-#include <climits>
-#endif
+#include "parallel_runtime.h"
 
 /* TBB 2021.6 is the minimum version */
 #if (TBB_INTERFACE_VERSION < 12060)
@@ -34,11 +29,8 @@ Implement parallel vectorize workqueue on top of Intel TBB.
 #define _DEBUG 0
 #define _TRACE_SPLIT 0
 
-#ifndef PYCC_TBB
+#ifndef PYCC_PARALLEL
 static tbb::task_group *tg = NULL;
-
-static tbb::task_scheduler_handle tsh;
-static bool tsh_was_initialized = false;
 #endif
 
 #ifdef _MSC_VER
@@ -90,23 +82,7 @@ get_thread_id(void)
     }
 }
 
-// watch the arena, if it decides to create more threads/add threads into the
-// arena then make sure they get the right thread count
-class fix_tls_observer: public tbb::task_scheduler_observer {
-    int mask_val;
-    void on_scheduler_entry( bool is_worker ) override;
-public:
-    fix_tls_observer(tbb::task_arena &arena, int mask) : tbb::task_scheduler_observer(arena), mask_val(mask)
-    {
-        observe(true);
-    }
-};
-
-void fix_tls_observer::on_scheduler_entry(bool worker) {
-    set_num_threads(mask_val);
-}
-
-#ifndef PYCC_TBB
+#ifndef PYCC_PARALLEL
 static void
 add_task(void *fn, void *args, void *dims, void *steps, void *data)
 {
@@ -153,19 +129,7 @@ parallel_for(void *fn, char **args, size_t *dimensions, size_t *steps, void *dat
         printf("\n");
     }
 
-    // This is making the assumption that the calling thread knows the truth
-    // about num_threads, which should be correct via the following:
-    // program starts/reinits and the threadpool launches, num_threads TLS is
-    // set as default. Any thread spawned on init making a call to this function
-    // will have a valid num_threads TLS slot and so the task_arena is sized
-    // appropriately and it's value is used in the observer that fixes the TLS
-    // slots of any subsequent threads joining the task_arena. This leads to
-    // all threads in a task_arena having valid num_threads TLS slots prior to
-    // doing any work. Any further call to query the TLS slot value made by any
-    // thread in the arena is then safe and were any thread to create a nested
-    // parallel region the same logic applies as per program start/reinit.
     tbb::task_arena limited(num_threads);
-    fix_tls_observer observer(limited, num_threads);
 
     limited.execute([&]{
         using range_t = tbb::blocked_range<size_t>;
@@ -209,180 +173,139 @@ parallel_for(void *fn, char **args, size_t *dimensions, size_t *steps, void *dat
                 printf("\n");
             }
             auto func = reinterpret_cast<void (*)(char **args, size_t *dims, size_t *steps, void *data)>(fn);
+            int saved = _TLS_num_threads;
+            set_num_threads(num_threads);
             func(array_arg_space, count_space, steps, data);
+            set_num_threads(saved);
         });
     });
 }
 
-#ifdef PYCC_TBB
-extern "C" int pycc_tbb_init(void)
-{
-    const char *value = getenv("NUMBA_NUM_THREADS");
-    if (value == NULL) {
-        _INIT_NUM_THREADS = tbb::info::default_concurrency();
-        return 0;
-    }
+#ifndef _WIN32
+struct ForkState {
+    tbb::task_scheduler_handle handle;
+    std::thread::id owner;
+    bool unsafe_child = false;
+};
 
-    char *end;
-    errno = 0;
-    long count = strtol(value, &end, 10);
-    if (end == value || *end != '\0' || errno == ERANGE ||
-        count < 1 || count > INT_MAX) {
-        PyErr_SetString(PyExc_ValueError,
-                        "NUMBA_NUM_THREADS must be a positive int");
-        return -1;
-    }
-    _INIT_NUM_THREADS = static_cast<int>(count);
-    return 0;
-}
-
-extern "C" intp pycc_tbb_get_num_threads(void)
-{
-    return get_num_threads();
-}
-
-extern "C" intp pycc_tbb_get_thread_id(void)
-{
-    return get_thread_id();
-}
-
-extern "C" void pycc_tbb_save_error(PyObject **error)
-{
-    if (!PyErr_Occurred()) {
-        PyErr_SetString(PyExc_RuntimeError, "pycc parallel worker failed");
-    }
-    if (error[0] == NULL) {
-        PyErr_Fetch(error, error + 1, error + 2);
-    } else {
-        PyErr_Clear();
-    }
-}
-
-extern "C" int pycc_tbb_parallel_for(
-    void *fn, char **args, size_t *dims, size_t *steps, void *,
-    size_t inner_ndim, size_t array_count, intp num_threads)
-{
-    PyObject *error[3] = {};
-    PyGILState_STATE gil = PyGILState_Ensure();
-    PyThreadState *thread_state = PyEval_SaveThread();
-    bool dispatch_failed = false;
-    try {
-        parallel_for(fn, args, dims, steps, error, inner_ndim, array_count,
-                     static_cast<int>(num_threads));
-    } catch (...) {
-        dispatch_failed = true;
-    }
-    PyEval_RestoreThread(thread_state);
-    if (error[0] != NULL) {
-        PyErr_Restore(error[0], error[1], error[2]);
-    } else if (dispatch_failed) {
-        PyErr_SetString(PyExc_RuntimeError, "pycc oneTBB dispatch failed");
-    }
-    PyGILState_Release(gil);
-    return dispatch_failed || error[0] != NULL;
-}
-#else
-static std::thread::id init_thread_id;
-static THREAD_LOCAL(bool) need_reinit_after_fork = false;
-
-static void set_main_thread()
-{
-    init_thread_id = std::this_thread::get_id();
-}
-
-static bool is_main_thread()
-{
-    return std::this_thread::get_id() == init_thread_id;
-}
+static ForkState local_fork_state;
+static ForkState *fork_state;
+static thread_local bool fork_is_safe;
 
 static void prepare_fork(void)
 {
-    if(_DEBUG)
-    {
-        puts("Suspending TBB: prepare fork");
+    fork_is_safe = false;
+    if (local_fork_state.unsafe_child) {
+        return;
     }
-    if (tsh_was_initialized)
-    {
-        if(is_main_thread())
-        {
-            if (!tbb::finalize(tsh, std::nothrow))
-            {
-                tsh.release();
-                puts("Unable to join threads to shut down before fork(). "
-                     "This can break multithreading in child processes.\n");
-            }
-            tsh_was_initialized = false;
-            need_reinit_after_fork = true;
+    if (std::this_thread::get_id() != local_fork_state.owner) {
+        fprintf(stderr, "Numba: Attempted to fork from a non-main thread, "
+                        "the TBB library may be in an invalid state in the "
+                        "child process.\n");
+        return;
+    }
+
+    try {
+        if (!local_fork_state.handle) {
+            local_fork_state.handle = tbb::attach();
         }
-        else
-        {
-            fprintf(stderr, "Numba: Attempted to fork from a non-main thread, "
-                            "the TBB library may be in an invalid state in the "
-                            "child process.\n");
-        }
+        fork_is_safe = tbb::finalize(local_fork_state.handle, std::nothrow);
+    } catch (...) {
+        fork_is_safe = false;
+    }
+    if (!fork_is_safe) {
+        local_fork_state.handle.release();
+        fprintf(stderr, "Numba: Unable to shut down TBB before fork().\n");
     }
 }
 
-static void reset_after_fork(void)
+static void resume_child(void)
 {
-    if(_DEBUG)
-    {
-        puts("Resuming TBB: after fork");
-    }
-
-    if(need_reinit_after_fork)
-    {
-        tsh = tbb::attach();
-        set_main_thread();
-        tsh_was_initialized = true;
-        need_reinit_after_fork = false;
-    }
+    local_fork_state.unsafe_child = !fork_is_safe;
 }
 
-static void unload_tbb(void)
+static int init_fork_state(void)
 {
-    if (tg)
-    {
-        if(_DEBUG)
-        {
-            puts("Unloading TBB");
+    // JIT and all AOT extensions using the same TBB runtime share one handle.
+    const char *key = "_numba_tbb_fork_state_v1";
+    PyObject *state = PySys_GetObject(key);
+    if (state != NULL) {
+        fork_state = static_cast<ForkState *>(PyCapsule_GetPointer(state, key));
+        return fork_state == nullptr ? -1 : 0;
+    }
+
+    local_fork_state.handle = tbb::attach();
+    local_fork_state.owner = std::this_thread::get_id();
+    state = PyCapsule_New(&local_fork_state, key, NULL);
+    if (state == NULL) {
+        return -1;
+    }
+    int result = PySys_SetObject(key, state);
+    Py_DECREF(state);
+    if (result < 0) {
+        return -1;
+    }
+    if (pthread_atfork(prepare_fork, NULL, resume_child) != 0) {
+        PySys_SetObject(key, NULL);
+        PyErr_SetString(PyExc_RuntimeError, "Could not install TBB fork handlers");
+        return -1;
+    }
+    fork_state = &local_fork_state;
+    return 0;
+}
+#endif
+
+static const char *fork_error(void)
+{
+#ifndef _WIN32
+    if (fork_state != nullptr && fork_state->unsafe_child) {
+        return "Numba cannot use TBB in this forked child; use spawn";
+    }
+#endif
+    return nullptr;
+}
+
+int numba_parallel_init(int count)
+{
+    if (_INIT_NUM_THREADS > 0) {
+        return 0;
+    }
+    try {
+#ifndef _WIN32
+        if (init_fork_state() < 0) {
+            return -1;
         }
+#endif
+#ifndef PYCC_PARALLEL
+        tg = new tbb::task_group;
+#endif
+    } catch (...) {
+        PyErr_SetString(PyExc_RuntimeError, "Could not initialize Numba TBB");
+        return -1;
+    }
+    _INIT_NUM_THREADS = count;
+    return 0;
+}
+
+NUMBA_DEFINE_PARALLEL_BACKEND(tbb::info::default_concurrency(), fork_error())
+
+#ifndef PYCC_PARALLEL
+static void unload_tbb(void *)
+{
+    if (tg != NULL) {
         tg->wait();
         delete tg;
         tg = NULL;
-    }
-    if (tsh_was_initialized)
-    {
-        // blocking terminate is not strictly required here, ignore return value
-        (void)tbb::finalize(tsh, std::nothrow);
-        tsh_was_initialized = false;
     }
 }
 
 static void launch_threads(int count)
 {
-    if(tg)
-        return;
-
-    if(_DEBUG)
-        puts("Using TBB");
-
-    if(count < 1)
-        count = tbb::task_arena::automatic;
-
-    tsh = tbb::attach();
-    tsh_was_initialized = true;
-
-    tg = new tbb::task_group;
-    tg->run([] {}); // start creating threads asynchronously
-
-    _INIT_NUM_THREADS = count;
-
-    set_main_thread();
-
-#ifndef _MSC_VER
-    pthread_atfork(prepare_fork, reset_after_fork, reset_after_fork);
-#endif
+    PyGILState_STATE gil = PyGILState_Ensure();
+    if (numba_parallel_init(count) < 0) {
+        PyErr_WriteUnraisable(NULL);
+    }
+    PyGILState_Release(gil);
 }
 
 static void synchronize(void)
@@ -403,9 +326,10 @@ MOD_INIT(tbbpool)
     PyModuleDef *md = PyModule_GetDef(m);
     if (md)
     {
-        md->m_free = (freefunc)unload_tbb;
+        md->m_free = unload_tbb;
     }
 
+    NUMBA_PARALLEL_SYMBOLS(m);
     SetAttrStringFromVoidPointer(m, launch_threads);
     SetAttrStringFromVoidPointer(m, synchronize);
     SetAttrStringFromVoidPointer(m, ready);

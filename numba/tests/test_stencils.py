@@ -128,7 +128,7 @@ class TestStencilBase(unittest.TestCase):
         np.testing.assert_almost_equal(parfor_output, expected, decimal=3)
 
         # make sure parfor set up scheduling
-        self.assertIn('@do_scheduling', cpfunc.library.get_llvm_str())
+        self.assertIn('@numba_parallel_schedule', cpfunc.library.get_llvm_str())
 
 
 class TestStencil(TestStencilBase):
@@ -210,7 +210,7 @@ class TestStencil(TestStencilBase):
         # parfor result
         parfor_output = cpfunc.entry_point(n, w)
         np.testing.assert_almost_equal(parfor_output, expected, decimal=3)
-        self.assertIn('@do_scheduling', cpfunc.library.get_llvm_str())
+        self.assertIn('@numba_parallel_schedule', cpfunc.library.get_llvm_str())
         # test index_offsets
 
         def test_seq(n, w, offset):
@@ -230,7 +230,7 @@ class TestStencil(TestStencilBase):
                                                   types.intp))
         parfor_output = cpfunc.entry_point(n, w, offset)
         np.testing.assert_almost_equal(parfor_output, expected, decimal=3)
-        self.assertIn('@do_scheduling', cpfunc.library.get_llvm_str())
+        self.assertIn('@numba_parallel_schedule', cpfunc.library.get_llvm_str())
         # test slice in kernel
 
         def test_seq(n, w, offset):
@@ -247,7 +247,7 @@ class TestStencil(TestStencilBase):
                                                   types.intp))
         parfor_output = cpfunc.entry_point(n, w, offset)
         np.testing.assert_almost_equal(parfor_output, expected, decimal=3)
-        self.assertIn('@do_scheduling', cpfunc.library.get_llvm_str())
+        self.assertIn('@numba_parallel_schedule', cpfunc.library.get_llvm_str())
 
     @skip_unsupported
     def test_stencil3(self):
@@ -523,7 +523,7 @@ class TestStencil(TestStencilBase):
 
         cpfunc = self.compile_parallel(test_impl, (numba.float64[:],),
                                        stencil=False)
-        self.assertNotIn('@do_scheduling', cpfunc.library.get_llvm_str())
+        self.assertNotIn('@numba_parallel_schedule', cpfunc.library.get_llvm_str())
 
     @skip_unsupported
     def test_stencil_nested1(self):
@@ -777,10 +777,10 @@ class TestManyStencils(TestStencilBase):
                 self.assertEqual(expected.dtype, parfor_output.dtype)
                 try:
                     self.assertIn(
-                        '@do_scheduling',
+                        '@numba_parallel_schedule',
                         wrapped_cpfunc.library.get_llvm_str())
                 except AssertionError:
-                    msg = 'Could not find `@do_scheduling` in LLVM IR'
+                    msg = 'Could not find `@numba_parallel_schedule` in LLVM IR'
                     raise AssertionError(msg)
         except Exception as e:
             should_not_fail.append(

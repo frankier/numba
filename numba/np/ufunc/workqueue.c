@@ -44,7 +44,7 @@ race conditions.
 #include <stddef.h>
 #include <stdio.h>
 #include "workqueue.h"
-#include "gufunc_scheduler.h"
+#include "parallel_runtime.h"
 
 #define _DEBUG 0
 
@@ -638,6 +638,14 @@ static void reset_after_fork(void)
     _nesting_level = 0;
 }
 
+int numba_parallel_init(int count)
+{
+    launch_threads(count);
+    return 0;
+}
+
+NUMBA_DEFINE_PARALLEL_BACKEND(_INIT_NUM_THREADS, NULL)
+
 MOD_INIT(workqueue)
 {
     PyObject *m;
@@ -645,6 +653,7 @@ MOD_INIT(workqueue)
     if (m == NULL)
         return MOD_ERROR_VAL;
 
+    NUMBA_PARALLEL_SYMBOLS(m);
     SetAttrStringFromVoidPointer(m, launch_threads);
     SetAttrStringFromVoidPointer(m, synchronize);
     SetAttrStringFromVoidPointer(m, ready);

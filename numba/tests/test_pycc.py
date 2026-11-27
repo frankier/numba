@@ -193,31 +193,60 @@ class TestCC(BasePYCCTest):
     def test_parallel_tbb(self):
         build_script = textwrap.dedent("""\
             import sys
-            from numba import prange
-            from numba.np.ufunc.parallel import _iget_num_threads, _iget_thread_id
+            from numba import (get_num_threads, get_parallel_chunksize,
+                               get_thread_id, jit, prange, set_num_threads,
+                               set_parallel_chunksize)
             from numba.pycc import CC
 
             cc = CC('pycc_tbb_test')
-            cc.parallel = True
 
-            @cc.export('sum_array', 'i8(i8[::1], i8)')
+            @cc.export('sum_array', 'i8(i8[::1], i8)', parallel=True)
             def sum_array(a, start):
                 total = 0
                 for i in prange(start, a.size):
                     total += a[i]
                 return total
 
-            @cc.export('mark_workers', 'void(i8[::1], i8[::1])')
+            @cc.export('mark_workers', 'void(i8[::1], i8[::1])', parallel=True)
+            @cc.export('mark_serial', 'void(i8[::1], i8[::1])')
             def mark_workers(ids, limits):
                 for i in prange(ids.size):
-                    ids[i] = _iget_thread_id()
-                    limits[i] = _iget_num_threads()
+                    ids[i] = get_thread_id()
+                    limits[i] = get_num_threads() if get_parallel_chunksize() == 0 else -1
+
+            @cc.export('set_controls', 'uintp(i8, uintp)')
+            def set_controls(threads, chunksize):
+                set_num_threads(threads)
+                return set_parallel_chunksize(chunksize)
+
+            @jit(parallel=True)
+            def sum_helper(a):
+                total = 0
+                for i in prange(a.size):
+                    total += a[i]
+                return total
+
+            @cc.export('sum_via_helper', 'i8(i8[::1])')
+            def sum_via_helper(a):
+                return sum_helper(a)
+
+            @jit
+            def check_value(value):
+                if value < 0:
+                    raise ValueError("negative value", value)
+
+            @cc.export('check_values', 'void(i8[::1])', parallel=True)
+            def check_values(a):
+                for i in prange(a.size):
+                    check_value(a[i])
 
             mode, cc.output_dir = sys.argv[1:]
             if mode == 'setuptools':
                 from setuptools import setup
+                extension = cc.distutils_extension()
+                cc.export('late', 'i8()')(lambda: 0)
                 setup(name='pycc_tbb_test',
-                      ext_modules=[cc.distutils_extension()],
+                      ext_modules=[extension],
                       script_args=['build_ext', '--build-lib', cc.output_dir,
                                    '--build-temp', 'build'])
             else:
@@ -243,22 +272,64 @@ class TestCC(BasePYCCTest):
             assert lib.sum_array(a, 0) == a.sum()
             assert lib.sum_array(a, -2) == a.sum() + a[-2:].sum()
             assert lib.sum_array(a[:0], 0) == 0
+            assert lib.sum_via_helper(a) == a.sum()
+            assert not hasattr(lib, 'late')
             ids, limits = np.empty_like(a), np.empty_like(a)
             lib.mark_workers(ids, limits)
             assert np.all((ids >= 0) & (ids < 2))
             assert np.all(limits == 2)
+
+            assert lib.set_controls(1, 7) == 0
+            lib.mark_workers(ids, limits)
+            assert np.all(ids == 0)
+            assert np.all(limits == 1)
+            lib.mark_serial(ids, limits)
+            assert np.all(ids == 0)
+            assert np.all(limits == -1)
+
+            chunk = int(np.iinfo(np.uintp).max)
+            assert lib.set_controls(1, chunk) == 7
+            assert lib.set_controls(2, 0) == chunk
+            try:
+                lib.set_controls(3, 0)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('thread limit was not checked')
+
             try:
                 lib.sum_array(a, -a.size - 1)
             except IndexError:
                 pass
             else:
                 raise AssertionError('worker IndexError was lost')
+            a[-1] = -7
+            try:
+                lib.check_values(a)
+            except ValueError as exc:
+                assert exc.args == ("negative value", -7)
+            else:
+                raise AssertionError('dynamic worker exception was lost')
+
             with ThreadPoolExecutor(max_workers=2) as pool:
                 totals = pool.map(lib.sum_array, [a, a], [0, 0])
                 assert list(totals) == [a.sum(), a.sum()]
+
+            if sys.platform.startswith('linux'):
+                pid = os.fork()
+                if pid == 0:
+                    try:
+                        assert lib.sum_array(a, 0) == a.sum()
+                    except BaseException:
+                        import traceback
+                        traceback.print_exc()
+                        os._exit(1)
+                    os._exit(0)
+                assert os.waitpid(pid, 0)[1] == 0
+                assert lib.sum_array(a, 0) == a.sum()
             """)
         env = dict(os.environ, NUMBA_BOUNDSCHECK='1', NUMBA_NUM_THREADS='2',
-                   NUMBA_THREADING_LAYER='invalid-for-pycc-test')
+                   NUMBA_THREADING_LAYER='workqueue')
         repo_root = os.path.dirname(os.path.dirname(base_path))
         env['PYTHONPATH'] = os.pathsep.join(
             p for p in (repo_root, env.get('PYTHONPATH')) if p)
@@ -270,7 +341,7 @@ class TestCC(BasePYCCTest):
                     [sys.executable, script_path, mode, output_dir],
                     env=env, cwd=self.tmpdir)
                 subprocess.check_call([sys.executable, '-c', runtime_script],
-                                      env=env, cwd=output_dir)
+                                      env=env, cwd=output_dir, timeout=60)
 
     def test_compile_for_cpu(self):
         # Compiling for the host CPU should always succeed

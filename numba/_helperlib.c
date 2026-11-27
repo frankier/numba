@@ -1086,6 +1086,37 @@ error:
 NUMBA_EXPORT_FUNC(PyObject *)
 numba_runtime_build_excinfo_struct(PyObject* struct_gv, PyObject* exc_args)
 {
+#ifdef PYCC_COMPILING
+    PyObject *info = numba_unpickle(PyBytes_AS_STRING(struct_gv),
+                                   (int)PyBytes_GET_SIZE(struct_gv), NULL);
+    if (info == NULL) {
+        return NULL;
+    }
+
+    PyObject *exc, *static_args, *loc, *dynamic, *args = NULL, *result = NULL;
+    if (!PyArg_ParseTuple(info, "OOOO", &exc, &static_args, &loc, &dynamic)) {
+        goto done;
+    }
+
+    Py_ssize_t argc = PyTuple_GET_SIZE(static_args);
+    args = PyTuple_New(argc);
+    if (args == NULL) {
+        goto done;
+    }
+    Py_ssize_t next = 0;
+    for (Py_ssize_t i = 0; i < argc; i++) {
+        PyObject *value = PyTuple_GET_ITEM(dynamic, i) == Py_True
+            ? PyTuple_GET_ITEM(exc_args, next++)
+            : PyTuple_GET_ITEM(static_args, i);
+        Py_INCREF(value);
+        PyTuple_SET_ITEM(args, i, value);
+    }
+    result = PyTuple_Pack(3, exc, args, loc);
+done:
+    Py_XDECREF(args);
+    Py_DECREF(info);
+    return result;
+#else
     PyObject *obj = NULL;
     static PyObject *func = NULL;
 
@@ -1107,6 +1138,7 @@ numba_runtime_build_excinfo_struct(PyObject* struct_gv, PyObject* exc_args)
     // func returns None on failure (i.e. can't serialize one of the args).
     // Is there a better way to handle this? raise an exception here?
     return obj;
+#endif
 }
 
 /*

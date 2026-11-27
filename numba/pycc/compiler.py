@@ -15,7 +15,7 @@ from numba.core.cpu_options import ParallelOptions
 
 from numba.core.registry import cpu_target
 from numba.core.runtime import nrtdynmod
-from numba.core import cgutils
+from numba.core import cgutils, errors
 from numba.core.environment import lookup_environment
 
 
@@ -70,10 +70,11 @@ class ExportEntry(object):
     A simple record for exporting symbols.
     """
 
-    def __init__(self, symbol, signature, function):
+    def __init__(self, symbol, signature, function, parallel=False):
         self.symbol = symbol
         self.signature = signature
         self.function = function
+        self.parallel = parallel
 
     def __repr__(self):
         return "ExportEntry(%r, %r)" % (self.symbol, self.signature)
@@ -111,7 +112,7 @@ class _ModuleCompiler(object):
                                        lt._int32))
     env_def_ptr = ir.PointerType(env_def_ty)
 
-    def __init__(self, export_entries, module_name, use_nrt=False, parallel=False,
+    def __init__(self, export_entries, module_name, use_nrt=False,
                  **aot_options):
         self.module_name = module_name
         self.export_python_wrap = False
@@ -120,7 +121,6 @@ class _ModuleCompiler(object):
         # Used by the CC API but not the legacy API
         self.external_init_function = None
         self.use_nrt = use_nrt
-        self.parallel = parallel
 
         self.typing_context = cpu_target.typing_context
         self.context = cpu_target.target_context.with_aot_codegen(
@@ -150,7 +150,6 @@ class _ModuleCompiler(object):
         # Generate IR for all exported functions
         flags = Flags()
         flags.no_compile = True
-        flags.auto_parallel = ParallelOptions(self.parallel)
         if not self.export_python_wrap:
             flags.no_cpython_wrapper = True
             flags.no_cfunc_wrapper = True
@@ -161,10 +160,12 @@ class _ModuleCompiler(object):
             library.add_ir_module(nrt_module)
 
         for entry in self.export_entries:
+            export_flags = flags.copy()
+            export_flags.auto_parallel = ParallelOptions(entry.parallel)
             cres = compile_extra(self.typing_context, self.context,
                                 entry.function,
                                 entry.signature.args,
-                                entry.signature.return_type, flags,
+                                entry.signature.return_type, export_flags,
                                 locals={}, library=library)
 
             # Fix up dynamic exc globals
@@ -210,6 +211,12 @@ class _ModuleCompiler(object):
 
         # Hide all functions in the DLL except those explicitly exported
         library.finalize()
+        if not any(entry.parallel for entry in self.export_entries):
+            if any(fn.is_declaration and fn.name.startswith("numba_parallel_")
+                   for fn in library._final_module.functions):
+                raise errors.UnsupportedError(
+                    "A standalone module containing parallel calls requires "
+                    "an export with parallel=True")
         for fn in library.get_defined_functions():
             if fn.name not in self.dll_exports:
                 if fn.linkage in {Linkage.private, Linkage.internal}:

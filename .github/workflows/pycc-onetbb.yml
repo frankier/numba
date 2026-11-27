@@ -1,4 +1,4 @@
-name: pycc oneTBB
+name: pycc parallel threading
 
 on:
   pull_request:
@@ -55,19 +55,25 @@ jobs:
         run: |
           conda install -y numpy=2.4 tbb-devel setuptools pip
           python -m pip install --index-url https://pypi.anaconda.org/numba/label/dev/simple/ llvmlite==0.51.0.dev2
-      - name: Build Numba and test the oneTBB pycc extension
+      - name: Build Numba and test the pycc threading backends
         run: |
           export TBBROOT="$(python -c 'import os, sys; from pathlib import Path; print(Path(sys.prefix) / "Library" if os.name == "nt" else Path(sys.prefix))')"
           case "$RUNNER_OS" in
-            Linux) export LD_LIBRARY_PATH="$TBBROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+            Linux)
+              export LD_LIBRARY_PATH="$TBBROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export NUMBA_TEST_PYCC_OPENMP=1
+              ;;
             macOS) export DYLD_LIBRARY_PATH="$TBBROOT/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" ;;
           esac
           python setup.py build_ext --inplace
           python - <<'PY'
+          import os
           import unittest
 
-          suite = unittest.defaultTestLoader.loadTestsFromName(
-              "numba.tests.test_pycc.TestCC.test_parallel_tbb")
+          tests = ["numba.tests.test_pycc.TestCC.test_parallel_tbb"]
+          if os.environ.get("NUMBA_TEST_PYCC_OPENMP"):
+              tests.append("numba.tests.test_pycc.TestCC.test_parallel_omp")
+          suite = unittest.defaultTestLoader.loadTestsFromNames(tests)
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           raise SystemExit(not result.wasSuccessful() or bool(result.skipped))
           PY

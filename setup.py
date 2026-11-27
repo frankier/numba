@@ -444,7 +444,7 @@ metadata = dict(
         # Some C files are needed by pycc
         "numba": ["*.c", "*.h", "py.typed"],
         "numba.pycc": ["*.c", "*.h"],
-        "numba.np.ufunc": ["tbbpool.cpp", "gufunc_scheduler.cpp",
+        "numba.np.ufunc": ["tbbpool.cpp", "omppool.cpp", "gufunc_scheduler.cpp",
                           "gufunc_scheduler.h", "workqueue.h",
                           "parallel_runtime.cpp", "parallel_runtime.h"],
         "numba.core.runtime": ["*.cpp", "*.c", "*.h"],

@@ -287,7 +287,8 @@ int numba_parallel_init(int count)
     return 0;
 }
 
-NUMBA_DEFINE_PARALLEL_BACKEND(tbb::info::default_concurrency(), fork_error())
+NUMBA_DEFINE_PARALLEL_BACKEND(tbb::info::default_concurrency(),
+                              fork_error(), parallel_for)
 
 #ifndef PYCC_PARALLEL
 static void unload_tbb(void *)

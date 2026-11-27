@@ -644,7 +644,7 @@ int numba_parallel_init(int count)
     return 0;
 }
 
-NUMBA_DEFINE_PARALLEL_BACKEND(_INIT_NUM_THREADS, NULL)
+NUMBA_DEFINE_PARALLEL_BACKEND(_INIT_NUM_THREADS, NULL, parallel_for)
 
 MOD_INIT(workqueue)
 {

@@ -191,6 +191,14 @@ class TestCC(BasePYCCTest):
 
     @unittest.skipUnless(os.environ.get('TBBROOT'), 'requires a oneTBB SDK')
     def test_parallel_tbb(self):
+        self.check_parallel_backend('tbb')
+
+    @unittest.skipUnless(os.environ.get('NUMBA_TEST_PYCC_OPENMP'),
+                         'requires an OpenMP toolchain')
+    def test_parallel_omp(self):
+        self.check_parallel_backend('omp')
+
+    def check_parallel_backend(self, backend):
         build_script = textwrap.dedent("""\
             import sys
             from numba import (get_num_threads, get_parallel_chunksize,
@@ -198,7 +206,9 @@ class TestCC(BasePYCCTest):
                                set_parallel_chunksize)
             from numba.pycc import CC
 
-            cc = CC('pycc_tbb_test')
+            mode, output_dir, backend = sys.argv[1:]
+            cc = CC('pycc_parallel_test', threading_layer=backend)
+            cc.output_dir = output_dir
 
             @cc.export('sum_array', 'i8(i8[::1], i8)', parallel=True)
             def sum_array(a, start):
@@ -240,12 +250,11 @@ class TestCC(BasePYCCTest):
                 for i in prange(a.size):
                     check_value(a[i])
 
-            mode, cc.output_dir = sys.argv[1:]
             if mode == 'setuptools':
                 from setuptools import setup
                 extension = cc.distutils_extension()
                 cc.export('late', 'i8()')(lambda: 0)
-                setup(name='pycc_tbb_test',
+                setup(name='pycc_parallel_test',
                       ext_modules=[extension],
                       script_args=['build_ext', '--build-lib', cc.output_dir,
                                    '--build-temp', 'build'])
@@ -263,10 +272,11 @@ class TestCC(BasePYCCTest):
             import numpy as np
 
             sys.modules['numba'] = sys.modules['llvmlite'] = None
-            if sys.platform == 'win32':
+            backend = sys.argv[1]
+            if sys.platform == 'win32' and backend == 'tbb':
                 tbb_dll_dir = os.add_dll_directory(
                     os.path.join(os.environ['TBBROOT'], 'bin'))
-            import pycc_tbb_test as lib
+            import pycc_parallel_test as lib
 
             a = np.arange(4096, dtype=np.int64)
             assert lib.sum_array(a, 0) == a.sum()
@@ -278,8 +288,15 @@ class TestCC(BasePYCCTest):
             lib.mark_workers(ids, limits)
             assert np.all((ids >= 0) & (ids < 2))
             assert np.all(limits == 2)
+            if backend == 'omp':
+                assert np.any(ids == 1)
 
-            assert lib.set_controls(1, 7) == 0
+            assert lib.set_controls(2, 7) == 0
+            lib.mark_workers(ids, limits)
+            assert np.all((ids >= 0) & (ids < 2))
+            assert np.all(limits == 2)
+
+            assert lib.set_controls(1, 7) == 7
             lib.mark_workers(ids, limits)
             assert np.all(ids == 0)
             assert np.all(limits == 1)
@@ -319,7 +336,15 @@ class TestCC(BasePYCCTest):
                 pid = os.fork()
                 if pid == 0:
                     try:
-                        assert lib.sum_array(a, 0) == a.sum()
+                        if backend == 'tbb':
+                            assert lib.sum_array(a, 0) == a.sum()
+                        else:
+                            try:
+                                lib.sum_array(a, 0)
+                            except RuntimeError as exc:
+                                assert 'OpenMP' in str(exc) and 'spawn' in str(exc)
+                            else:
+                                raise AssertionError('OpenMP ran in a forked child')
                     except BaseException:
                         import traceback
                         traceback.print_exc()
@@ -329,7 +354,8 @@ class TestCC(BasePYCCTest):
                 assert lib.sum_array(a, 0) == a.sum()
             """)
         env = dict(os.environ, NUMBA_BOUNDSCHECK='1', NUMBA_NUM_THREADS='2',
-                   NUMBA_THREADING_LAYER='workqueue')
+                   NUMBA_THREADING_LAYER='workqueue', OMP_DYNAMIC='FALSE',
+                   OMP_THREAD_LIMIT='2')
         repo_root = os.path.dirname(os.path.dirname(base_path))
         env['PYTHONPATH'] = os.pathsep.join(
             p for p in (repo_root, env.get('PYTHONPATH')) if p)
@@ -338,10 +364,11 @@ class TestCC(BasePYCCTest):
                 output_dir = os.path.join(self.tmpdir, mode)
                 os.mkdir(output_dir)
                 subprocess.check_call(
-                    [sys.executable, script_path, mode, output_dir],
+                    [sys.executable, script_path, mode, output_dir, backend],
                     env=env, cwd=self.tmpdir)
-                subprocess.check_call([sys.executable, '-c', runtime_script],
-                                      env=env, cwd=output_dir, timeout=60)
+                subprocess.check_call(
+                    [sys.executable, '-c', runtime_script, backend],
+                    env=env, cwd=output_dir, timeout=60)
 
     def test_compile_for_cpu(self):
         # Compiling for the host CPU should always succeed

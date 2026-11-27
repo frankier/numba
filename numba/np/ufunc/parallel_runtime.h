@@ -39,7 +39,7 @@ VISIBILITY_HIDDEN int numba_parallel_backend_default_threads(void);
 }
 #endif
 
-#define NUMBA_DEFINE_PARALLEL_BACKEND(default_threads, check_dispatch)        \
+#define NUMBA_DEFINE_PARALLEL_BACKEND(default_threads, check_dispatch, run)    \
     int numba_parallel_get_num_threads(void) { return get_num_threads(); }    \
     int numba_parallel_get_max_threads(void) { return _INIT_NUM_THREADS; }    \
     int numba_parallel_get_thread_id(void) { return get_thread_id(); }        \
@@ -51,8 +51,7 @@ VISIBILITY_HIDDEN int numba_parallel_backend_default_threads(void);
     {                                                                        \
         const char *error = check_dispatch;                                  \
         if (error == NULL) {                                                 \
-            parallel_for(fn, args, dims, steps, data, inner_ndim,             \
-                         array_count, count);                                \
+            run(fn, args, dims, steps, data, inner_ndim, array_count, count);  \
         }                                                                    \
         return error;                                                        \
     }

@@ -129,6 +129,10 @@ class Toolchain(object):
             msg = "Unknown platform %s" % plt
         raise RuntimeError(msg)
 
+    @property
+    def compiler_type(self):
+        return self._compiler.compiler_type
+
     def compile_objects(self, sources, output_dir,
                         include_dirs=(), depends=(), macros=(),
                         extra_cflags=None):

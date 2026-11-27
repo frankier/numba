@@ -52,11 +52,16 @@ class CC(object):
         'darwin': ['-Wl,-S'],
         }
 
-    def __init__(self, extension_name, source_module=None):
+    def __init__(self, extension_name, source_module=None, *,
+                 threading_layer="tbb"):
         if '.' in extension_name:
             raise ValueError("basename should be a simple module name, not "
                              "qualified name")
 
+        if threading_layer not in ("tbb", "omp"):
+            raise ValueError("threading_layer must be 'tbb' or 'omp'")
+
+        self._threading_layer = threading_layer
         self._basename = extension_name
         self._init_function = 'pycc_init_' + extension_name
         self._exported_functions = {}
@@ -174,7 +179,7 @@ class CC(object):
         if self._use_nrt:
             mixin_sources.append('../core/runtime/nrt.cpp')
         if self._needs_parallel_runtime():
-            mixin_sources.extend(('../np/ufunc/tbbpool.cpp',
+            mixin_sources.extend((f'../np/ufunc/{self._threading_layer}pool.cpp',
                                   '../np/ufunc/gufunc_scheduler.cpp',
                                   '../np/ufunc/parallel_runtime.cpp'))
         return [os.path.join(here, f) for f in mixin_sources]
@@ -200,43 +205,59 @@ class CC(object):
         return defines
 
     def _get_extra_cflags(self):
-        extra_cflags = self._extra_cflags.get(sys.platform, [])
-        if not extra_cflags:
-            extra_cflags = self._extra_cflags.get(os.name, [])
-        if self._needs_parallel_runtime() and os.name == 'posix':
-            extra_cflags = extra_cflags + ['-fvisibility=hidden']
-        return extra_cflags
+        flags = list(self._extra_cflags.get(sys.platform)
+                     or self._extra_cflags.get(os.name, []))
+        if not self._needs_parallel_runtime():
+            return flags
+        if os.name == 'posix':
+            flags.append('-fvisibility=hidden')
+        if self._threading_layer == 'omp':
+            if os.name == 'nt' and self._toolchain.compiler_type == 'msvc':
+                flags.append('/openmp')
+            elif sys.platform == 'darwin':
+                flags.extend(['-Xclang', '-fopenmp'])
+            else:
+                flags.append('-fopenmp')
+        return flags
 
-    def _get_tbb_options(self):
+    def _get_parallel_link_options(self):
         if not self._needs_parallel_runtime():
             return [], [], []
 
         default_root = (os.path.join(sys.prefix, 'Library')
                         if os.name == 'nt' else sys.prefix)
-        root = os.environ.get('TBBROOT') or default_root
-        include_dirs = [os.path.join(root, 'include')]
-        library_dirs = [os.path.join(root, 'lib', *parts) for parts in
-                        ((), ('intel64', 'gcc4.4'), ('intel64', 'gcc4.8'),
-                         ('intel64', 'vc_mt'))]
-        libraries = ['tbb12' if os.name == 'nt' else 'tbb']
-        return include_dirs, [d for d in library_dirs if os.path.isdir(d)], libraries
+        if self._threading_layer == 'omp':
+            root = os.environ.get('OPENMP_ROOT') or default_root
+            libraries = ['omp'] if sys.platform == 'darwin' else []
+            subdirs = [('lib',), ('lib64',)]
+        else:
+            root = os.environ.get('TBBROOT') or default_root
+            libraries = ['tbb12' if os.name == 'nt' else 'tbb']
+            subdirs = [('lib',), ('lib64',), ('lib', 'intel64', 'gcc4.4'),
+                       ('lib', 'intel64', 'gcc4.8'), ('lib', 'intel64', 'vc_mt')]
+        library_dirs = [os.path.join(root, *parts) for parts in subdirs]
+        return ([os.path.join(root, 'include')],
+                [path for path in library_dirs if os.path.isdir(path)],
+                libraries)
 
     def _get_extra_ldflags(self):
-        extra_ldflags = self._extra_ldflags.get(sys.platform, [])
-        if not extra_ldflags:
-            extra_ldflags = self._extra_ldflags.get(os.name, [])
+        flags = list(self._extra_ldflags.get(sys.platform)
+                     or self._extra_ldflags.get(os.name, []))
         # helperlib uses pthread on linux. make sure we are linking to it.
-        if sys.platform.startswith("linux"):
-            if "-pthread" not in extra_ldflags:
-                extra_ldflags.append('-pthread')
-        return extra_ldflags
+        if sys.platform.startswith("linux") and "-pthread" not in flags:
+            flags.append('-pthread')
+        if (self._needs_parallel_runtime() and self._threading_layer == 'omp'
+                and sys.platform != 'darwin'
+                and self._toolchain.compiler_type != 'msvc'):
+            flags.append('-fopenmp')
+        return flags
 
     def _compile_mixins(self, build_dir):
         sources = self._get_mixin_sources()
         macros = self._get_mixin_defines()
         include_dirs = self._toolchain.get_python_include_dirs()
-        tbb_includes, _, _ = self._get_tbb_options()
-        include_dirs += tbb_includes
+        parallel_includes, _, _ = self._get_parallel_link_options()
+        include_dirs += parallel_includes
 
         extra_cflags = self._get_extra_cflags()
         # XXX distutils creates a whole subtree inside build_dir,
@@ -272,9 +293,9 @@ class CC(object):
 
             extra_ldflags = self._get_extra_ldflags()
             output_dll = os.path.join(self._output_dir, self._output_file)
-            _, tbb_lib_dirs, tbb_libs = self._get_tbb_options()
-            libraries = self._toolchain.get_python_libraries() + tbb_libs
-            library_dirs = tbb_lib_dirs + self._toolchain.get_python_library_dirs()
+            _, lib_dirs, libs = self._get_parallel_link_options()
+            libraries = self._toolchain.get_python_libraries() + libs
+            library_dirs = lib_dirs + self._toolchain.get_python_library_dirs()
             self._toolchain.link_shared(
                 output_dll, objects, libraries, library_dirs,
                 export_symbols=dll_exports, extra_ldflags=extra_ldflags,
@@ -291,14 +312,13 @@ class CC(object):
                               + self._get_extra_cflags())
         extra_link_args = (kwargs.pop('extra_link_args', [])
                            + self._get_extra_ldflags())
-        tbb_includes, tbb_lib_dirs, tbb_libs = self._get_tbb_options()
+        includes, lib_dirs, libs = self._get_parallel_link_options()
         include_dirs = (kwargs.pop('include_dirs', [])
-                        + self._toolchain.get_python_include_dirs()
-                        + tbb_includes)
+                        + self._toolchain.get_python_include_dirs() + includes)
         libraries = (kwargs.pop('libraries', [])
-                     + self._toolchain.get_python_libraries() + tbb_libs)
-        library_dirs = (kwargs.pop('library_dirs', [])
-                        + tbb_lib_dirs + self._toolchain.get_python_library_dirs())
+                     + self._toolchain.get_python_libraries() + libs)
+        library_dirs = (kwargs.pop('library_dirs', []) + lib_dirs
+                        + self._toolchain.get_python_library_dirs())
         python_package_path = self._source_module[:self._source_module.rfind('.')+1]
 
         ext = _CCExtension(name=python_package_path + self._basename,

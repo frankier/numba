@@ -138,6 +138,10 @@ that calls the setters. Thread masks and chunk sizes are local to the calling
 thread and extension. A positive chunk size lets either backend distribute
 smaller chunks for uneven workloads.
 
+OpenMP uses the same initialization for nested parallel regions as JIT.
+A separately compiled parallel helper can form its own team inside an outer
+parallel region, subject to the OpenMP runtime's thread limits.
+
 The extension's runtime also handles calls to parallel helpers compiled by
 Numba during the build. Mark at least one export with ``parallel=True`` when
 the extension calls those helpers or uses the threading APIs.

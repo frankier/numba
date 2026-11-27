@@ -229,6 +229,8 @@ class CC(object):
         if self._threading_layer == 'omp':
             root = os.environ.get('OPENMP_ROOT') or default_root
             libraries = ['omp'] if sys.platform == 'darwin' else []
+            if sys.platform.startswith('linux'):
+                libraries.append('dl')
             subdirs = [('lib',), ('lib64',)]
         else:
             root = os.environ.get('TBBROOT') or default_root

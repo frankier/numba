@@ -240,6 +240,7 @@ parallel_for(void *fn, char **args, size_t *dims, size_t *steps, void *data,
     parallel_for_impl(fn, args, dims, steps, data, inner_ndim, array_count,
                       count, false);
 }
+#endif
 
 // Look up `name` in any library already loaded into this process. Returns
 // NULL if the symbol is not present, or if the symbol's value is NULL (the
@@ -312,7 +313,7 @@ static void launch_threads(int count)
 {
     // this must be called in a fork+thread safe region from Python
     static bool initialized = false;
-#ifdef _NOT_FORKSAFE
+#if defined(_NOT_FORKSAFE) || (defined(PYCC_PARALLEL) && !defined(_WIN32))
     parent_pid = getpid(); // record the parent PID for use later
     if(_DEBUG_FORK)
     {
@@ -354,7 +355,6 @@ static void launch_threads(int count)
 
     _INIT_NUM_THREADS = count;
 }
-#endif
 
 static const char *fork_error(void)
 {
@@ -368,14 +368,7 @@ static const char *fork_error(void)
 
 int numba_parallel_init(int count)
 {
-#ifdef PYCC_PARALLEL
-#ifndef _WIN32
-    parent_pid = getpid();
-#endif
-    _INIT_NUM_THREADS = count;
-#else
     launch_threads(count);
-#endif
     return 0;
 }
 

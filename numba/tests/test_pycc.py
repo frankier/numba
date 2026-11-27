@@ -240,6 +240,17 @@ class TestCC(BasePYCCTest):
             def sum_via_helper(a):
                 return sum_helper(a)
 
+            if backend == 'omp':
+                @jit(parallel=True)
+                def mark_inner(ids):
+                    for i in prange(ids.size):
+                        ids[i] = get_thread_id()
+
+                @cc.export('mark_nested', 'void(i8[:, ::1])', parallel=True)
+                def mark_nested(ids):
+                    for i in prange(ids.shape[0]):
+                        mark_inner(ids[i])
+
             @jit
             def check_value(value):
                 if value < 0:
@@ -290,6 +301,11 @@ class TestCC(BasePYCCTest):
             assert np.all(limits == 2)
             if backend == 'omp':
                 assert np.any(ids == 1)
+                nested_ids = np.full((2, 1024), -1, dtype=np.int64)
+                lib.mark_nested(nested_ids)
+                assert np.all((nested_ids >= 0) & (nested_ids < 2))
+                if sys.platform.startswith('linux'):
+                    assert np.any(nested_ids == 1)
 
             assert lib.set_controls(2, 7) == 0
             lib.mark_workers(ids, limits)
@@ -355,7 +371,7 @@ class TestCC(BasePYCCTest):
             """)
         env = dict(os.environ, NUMBA_BOUNDSCHECK='1', NUMBA_NUM_THREADS='2',
                    NUMBA_THREADING_LAYER='workqueue', OMP_DYNAMIC='FALSE',
-                   OMP_THREAD_LIMIT='2')
+                   OMP_THREAD_LIMIT='4', OMP_MAX_ACTIVE_LEVELS='1')
         repo_root = os.path.dirname(os.path.dirname(base_path))
         env['PYTHONPATH'] = os.pathsep.join(
             p for p in (repo_root, env.get('PYTHONPATH')) if p)
